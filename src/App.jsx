@@ -33,10 +33,10 @@ const GROUPES_INIT = [
     membres:[{nom:"OULD ALI Nassima",grade:"Agent d'Hygiène",equipe:null},{nom:"FERHAT Mourad",grade:"Agent d'Hygiène",equipe:null}] },
 ];
 const GROUPE_IDS = GROUPES_INIT.map(({ id }) => id);
-const CHAT_PROVIDER = "anthropic";
-const CHAT_MODEL = "claude-sonnet-4-20250514";
-const CHAT_API_URL = "https://api.anthropic.com/v1/messages";
-const CHAT_API_VERSION = "2023-06-01";
+// Remplacez les 4 constantes CHAT_* par :
+const CHAT_PROVIDER  = "gemini";
+const CHAT_MODEL     = "gemini-2.0-flash";
+const CHAT_API_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`;
 const CHAT_SETTINGS_TABLE = "service_ai_settings";
 
 // ══════════════════════════════════════════════
@@ -803,23 +803,7 @@ export default function App() {
     }
   }
 
-//gemini
-// Avant (Anthropic)
-const response = await fetch("https://api.anthropic.com/v1/messages", {
-  method: "POST",
-  headers: {
-    "x-api-key": process.env.REACT_APP_ANTHROPIC_API_KEY,
-    "anthropic-version": "2023-06-01",
-    "content-type": "application/json",
-  },
-  body: JSON.stringify({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 1000,
-    messages: [{ role: "user", content: prompt }],
-  }),
-});
-const data = await response.json();
-const text = data.content[0].text;
+
 
 // Après (Gemini 2.0 Flash — gratuit)
 const response = await fetch(
@@ -839,7 +823,7 @@ const text = data.candidates[0].content.parts[0].text;
   function addA(t){ setMsgs(p=>[...p,{r:"a",t}]); }
   async function saveChatApiKey(){
     const nextKey = chatApiKeyInput.trim();
-    if(!nextKey){ setChatApiKeyMsg("❌ Entrez une clé API Anthropic."); return; }
+    if(!nextKey){ setChatApiKeyMsg("❌ Entrez une clé API Gemini."); return; }
     if(!service?.id){ setChatApiKeyMsg("❌ Aucun service actif."); return; }
 
     setChatApiKeyBusy(true);
@@ -902,37 +886,66 @@ const text = data.candidates[0].content.parts[0].text;
       setChatApiKeyBusy(false);
     }
   }
-  async function sendChat(){
-    if(!chatReady){ setChatApiKeyMsg("❌ Configurez une clé API Anthropic avant d'utiliser le chat."); return; }
-    if(!chatIn.trim()||chatBusy)return;
-    const txt=chatIn.trim(); setChatIn(""); setMsgs(p=>[...p,{r:"u",t:txt}]); setChatBusy(true);
-    const ctx={annee:year,mois:month,nomMois:mn,service:service?.nom,equipeDebut:eqDebut,ordreRotation:ordre,
-      groupes:groupes.map(gg=>({id:gg.id,membres:gg.membres.map((m,mi)=>({index:mi,nom:m.nom,equipe:m.equipe,
-        conges:Object.entries(conges).filter(([k])=>k.startsWith(`${gg.id}:${mi}:`)).map(([k,v])=>({jour:+k.split(":")[2],code:v})),
-      }))}))};
-    try{
-      const res=await fetch(CHAT_API_URL,{method:"POST",headers:{
-          "Content-Type":"application/json",
-          "anthropic-version":CHAT_API_VERSION,
-          "anthropic-dangerous-direct-browser-access":"true",
-          "x-api-key":chatApiKey.trim(),
-        },
-        body:JSON.stringify({model:CHAT_MODEL,max_tokens:800,
-          system:`Agent planning hospitalier — ${service?.etablissement}. CONTEXTE:${JSON.stringify(ctx)}
+async function sendChat(){
+  if(!chatReady){
+    setChatApiKeyMsg("❌ Configurez une clé API Gemini avant d'utiliser le chat.");
+    return;
+  }
+  if(!chatIn.trim()||chatBusy) return;
+
+  const txt = chatIn.trim();
+  setChatIn(""); setMsgs(p=>[...p,{r:"u",t:txt}]); setChatBusy(true);
+
+  const ctx = {
+    annee:year, mois:month, nomMois:mn, service:service?.nom,
+    equipeDebut:eqDebut, ordreRotation:ordre,
+    groupes: groupes.map(gg=>({
+      id:gg.id,
+      membres: gg.membres.map((m,mi)=>({
+        index:mi, nom:m.nom, equipe:m.equipe,
+        conges: Object.entries(conges)
+          .filter(([k])=>k.startsWith(`${gg.id}:${mi}:`))
+          .map(([k,v])=>({jour:+k.split(":")[2],code:v})),
+      }))
+    }))
+  };
+
+  const systemPrompt = `Agent planning hospitalier — ${service?.etablissement}.
+CONTEXTE:${JSON.stringify(ctx)}
 CODES:G=Garde RE=Récup C=Congé CM=Maladie M=Maternité N=Normal F=Férié
 IDs:medecins|administratifs|paramedical|hygiene
 Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":5,"code":"C"}],"msg":"..."}
-          Sinon→JSON:{"action":"msg","msg":"..."}`,
-          messages:[{role:"user",content:txt}]})});
-      const d=await res.json();
-      if(!res.ok) throw new Error(d?.error?.message || `Erreur Anthropic (${res.status})`);
-      const raw=(d.content||[]).map(b=>b.text||"").join("");
-      let p; try{p=JSON.parse(raw.replace(/```json|```/g,"").trim())}catch{p={action:"msg",msg:raw}}
-      if(p.action==="update"&&p.updates){applyIA(p.updates);addA("✅ "+p.msg);}else addA(p.msg||raw);
-    }catch(e){addA("⚠️ Erreur: "+e.message);}
-    setChatBusy(false);
-    setTimeout(()=>chatEnd.current?.scrollIntoView({behavior:"smooth"}),100);
+Sinon→JSON:{"action":"msg","msg":"..."}`;
+
+  try {
+    const res = await fetch(
+      `${CHAT_API_URL}?key=${chatApiKey.trim()}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ parts: [{ text: txt }] }],
+          generationConfig: { maxOutputTokens: 800 },
+        }),
+      }
+    );
+    const d = await res.json();
+    if (!res.ok) throw new Error(d?.error?.message || `Erreur Gemini (${res.status})`);
+    const raw = d.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    let p;
+    try { p = JSON.parse(raw.replace(/```json|```/g,"").trim()); }
+    catch { p = { action:"msg", msg:raw }; }
+    if (p.action==="update" && p.updates) { applyIA(p.updates); addA("✅ "+p.msg); }
+    else addA(p.msg || raw);
+  } catch(e) {
+    addA("⚠️ Erreur: "+e.message);
   }
+
+  setChatBusy(false);
+  setTimeout(()=>chatEnd.current?.scrollIntoView({behavior:"smooth"}),100);
+}
+
 
   // ══════════════════════════════════════════════
   //  PDF — DÉCLENCHEURS
@@ -1216,7 +1229,7 @@ Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":
             <div style={{marginBottom:12,background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.08)",borderRadius:10,padding:14}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:10}}>
                 <div>
-                  <div style={{fontSize:12,fontWeight:700,color:"#93c5fd"}}>Clé API Anthropic</div>
+                  <div style={{fontSize:12,fontWeight:700,color:"#93c5fd"}}>Clé API Gemini</div>
                   <div style={{fontSize:10,color:"#475569",marginTop:2}}>
                     {chatReady ? `Configurée · ${chatKeyPreview(chatApiKey)}` : "Aucune clé configurée"}
                     {chatApiKeySource==="supabase" ? " · source Supabase" : chatApiKeySource==="local" ? " · source locale" : ""}
@@ -1233,7 +1246,7 @@ Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":
                     type={showChatApiKey ? "text" : "password"}
                     value={chatApiKeyInput}
                     onChange={e=>setChatApiKeyInput(e.target.value)}
-                    placeholder="sk-ant-..."
+                    placeholder="AIzaSy-..."
                     style={{...INP,flex:1,padding:"9px 11px",fontFamily:"monospace"}}
                   />
                   <button
@@ -1260,7 +1273,7 @@ Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":
                   ✕
                 </button>
                 <a
-                  href="https://console.anthropic.com/"
+                  href="aistudio.google.com/apikey"
                   target="_blank"
                   rel="noreferrer"
                   style={{fontSize:11,color:"#60a5fa",textDecoration:"none"}}
@@ -1297,7 +1310,7 @@ Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":
                 onChange={e=>setChatIn(e.target.value)}
                 onKeyDown={e=>e.key==="Enter"&&sendChat()}
                 disabled={!chatReady}
-                placeholder={chatReady ? "Parlez à l'agent…" : "Configurez une clé API Anthropic pour activer le chat"}
+                placeholder={chatReady ? "Parlez à l'agent…" : "Configurez une clé API Gemini pour activer le chat"}
                 style={{flex:1,background:"transparent",border:"none",color:chatReady?"#e2e8f0":"#64748b",fontSize:12,outline:"none"}}
               />
               <button onClick={sendChat} disabled={!chatReady||chatBusy||!chatIn.trim()} style={{...BTN,fontSize:11,background:!chatReady||chatBusy||!chatIn.trim()?"rgba(255,255,255,.04)":"linear-gradient(135deg,#1d4ed8,#0891b2)",color:!chatReady||chatBusy||!chatIn.trim()?"#475569":"white"}}>{chatBusy?"…":"↵"}</button>
