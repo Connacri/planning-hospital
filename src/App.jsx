@@ -33,11 +33,11 @@ const GROUPES_INIT = [
     membres:[{nom:"OULD ALI Nassima",grade:"Agent d'Hygiène",equipe:null},{nom:"FERHAT Mourad",grade:"Agent d'Hygiène",equipe:null}] },
 ];
 const GROUPE_IDS = GROUPES_INIT.map(({ id }) => id);
-// Remplacez les 4 constantes CHAT_* par :
 const CHAT_PROVIDER  = "gemini";
 const CHAT_MODEL     = "gemini-2.0-flash";
 const CHAT_API_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`;
 const CHAT_SETTINGS_TABLE = "service_ai_settings";
+const DEFAULT_CHAT_API_KEY = process.env.REACT_APP_GEMINI_API_KEY || "";
 
 // ══════════════════════════════════════════════
 //  HELPERS
@@ -71,6 +71,27 @@ function clearLocalChatKey(serviceId) {
 function isMissingRelationError(error) {
   const msg = `${error?.message || ""} ${error?.details || ""}`.toLowerCase();
   return error?.code === "PGRST205" || msg.includes("could not find the table") || msg.includes("does not exist");
+}
+async function generateWithGemini({ apiKey, systemPrompt, userPrompt }) {
+  const res = await fetch(
+    `${CHAT_API_URL}?key=${apiKey.trim()}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ parts: [{ text: userPrompt }] }],
+        generationConfig: { maxOutputTokens: 800 },
+      }),
+    }
+  );
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data?.error?.message || `Erreur Gemini (${res.status})`);
+  }
+
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 }
 
 function getSupabaseClient() {
@@ -479,7 +500,11 @@ export default function App() {
   const days    = getDays(year,month);
   const g       = groupes[gi];
   const eqDebut = equipeDebut(year,month,ordre);
-  const chatReady = Boolean(chatApiKey.trim());
+  const effectiveChatApiKey = chatApiKey.trim() || DEFAULT_CHAT_API_KEY.trim();
+  const effectiveChatApiKeySource = chatApiKey.trim()
+    ? chatApiKeySource
+    : (DEFAULT_CHAT_API_KEY.trim() ? "env" : "none");
+  const chatReady = Boolean(effectiveChatApiKey);
   const chatStatusTone = chatReady
     ? { bg:"rgba(34,197,94,.12)", border:"rgba(34,197,94,.35)", color:"#86efac" }
     : { bg:"rgba(239,68,68,.10)", border:"rgba(239,68,68,.28)", color:"#fca5a5" };
@@ -505,7 +530,7 @@ export default function App() {
           setChatApiKey("");
           setChatApiKeyInput("");
           setChatApiKeyMsg("");
-          setChatApiKeySource("none");
+          setChatApiKeySource(DEFAULT_CHAT_API_KEY.trim() ? "env" : "none");
         }
         return;
       }
@@ -514,7 +539,7 @@ export default function App() {
       if(active){
         setChatApiKey(localKey);
         setChatApiKeyInput(localKey);
-        setChatApiKeySource(localKey ? "local" : "none");
+        setChatApiKeySource(localKey ? "local" : (DEFAULT_CHAT_API_KEY.trim() ? "env" : "none"));
         setChatApiKeyMsg("");
       }
 
@@ -536,6 +561,8 @@ export default function App() {
       }catch{
         if(active && localKey){
           setChatApiKeySource("local");
+        } else if (active && DEFAULT_CHAT_API_KEY.trim()) {
+          setChatApiKeySource("env");
         }
       }
     }
@@ -841,6 +868,12 @@ export default function App() {
   }
   async function clearChatApiKey(){
     if(!service?.id) return;
+    if(!chatApiKey.trim()){
+      setChatApiKeyMsg(DEFAULT_CHAT_API_KEY.trim()
+        ? "⚠️ Aucune clé utilisateur à effacer. La clé Gemini fournie via .env reste active."
+        : "⚠️ Aucune clé utilisateur enregistrée.");
+      return;
+    }
 
     setChatApiKeyBusy(true);
     setChatApiKeyMsg("⏳ Suppression de la clé…");
@@ -901,21 +934,11 @@ Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":
 Sinon→JSON:{"action":"msg","msg":"..."}`;
 
   try {
-    const res = await fetch(
-      `${CHAT_API_URL}?key=${chatApiKey.trim()}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          system_instruction: { parts: [{ text: systemPrompt }] },
-          contents: [{ parts: [{ text: txt }] }],
-          generationConfig: { maxOutputTokens: 800 },
-        }),
-      }
-    );
-    const d = await res.json();
-    if (!res.ok) throw new Error(d?.error?.message || `Erreur Gemini (${res.status})`);
-    const raw = d.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const raw = await generateWithGemini({
+      apiKey: effectiveChatApiKey,
+      systemPrompt,
+      userPrompt: txt,
+    });
     let p;
     try { p = JSON.parse(raw.replace(/```json|```/g,"").trim()); }
     catch { p = { action:"msg", msg:raw }; }
@@ -1214,8 +1237,8 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
                 <div>
                   <div style={{fontSize:12,fontWeight:700,color:"#93c5fd"}}>Clé API Gemini</div>
                   <div style={{fontSize:10,color:"#475569",marginTop:2}}>
-                    {chatReady ? `Configurée · ${chatKeyPreview(chatApiKey)}` : "Aucune clé configurée"}
-                    {chatApiKeySource==="supabase" ? " · source Supabase" : chatApiKeySource==="local" ? " · source locale" : ""}
+                    {chatReady ? `Configurée · ${chatKeyPreview(effectiveChatApiKey)}` : "Aucune clé configurée"}
+                    {effectiveChatApiKeySource==="supabase" ? " · source Supabase" : effectiveChatApiKeySource==="local" ? " · source locale" : effectiveChatApiKeySource==="env" ? " · source .env" : ""}
                   </div>
                 </div>
                 <div style={{padding:"5px 10px",borderRadius:999,border:`1px solid ${chatStatusTone.border}`,background:chatStatusTone.bg,color:chatStatusTone.color,fontSize:10,fontWeight:700}}>
@@ -1256,7 +1279,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
                   ✕
                 </button>
                 <a
-                  href="aistudio.google.com/apikey"
+                  href="https://aistudio.google.com/app/apikey"
                   target="_blank"
                   rel="noreferrer"
                   style={{fontSize:11,color:"#60a5fa",textDecoration:"none"}}
@@ -1266,7 +1289,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
               </div>
 
               <div style={{fontSize:10,color:"#475569",marginTop:8}}>
-                Le bouton Sauver persiste la clé dans `localStorage`, puis tente une synchronisation Supabase si la table dédiée existe.
+                Le bouton Sauver persiste la clé dans `localStorage`, puis tente une synchronisation Supabase si la table dédiée existe. Si aucune clé n'est enregistrée ici, l'app peut utiliser `REACT_APP_GEMINI_API_KEY`.
               </div>
               {chatApiKeyMsg&&<div style={{marginTop:10,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.06)",fontSize:11,color:"#cbd5e1"}}>{chatApiKeyMsg}</div>}
             </div>
