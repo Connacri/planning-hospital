@@ -5,9 +5,13 @@
   "private": true,
   "homepage": "https://connacri.github.io/planning-hospital",
   "dependencies": {
+    "@supabase/supabase-js": "^2.105.1",
+    "debug": "^4.4.3",
+    "eslint-plugin-import": "^2.32.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "react-scripts": "5.0.1"
+    "react-scripts": "5.0.1",
+    "upath": "^3.0.7"
   },
   "scripts": {
     "start": "react-scripts start",
@@ -16,10 +20,20 @@
     "eject": "react-scripts eject"
   },
   "eslintConfig": {
-    "extends": ["react-app"]
+    "extends": [
+      "react-app"
+    ]
   },
   "browserslist": {
-    "production": [">0.2%", "not dead", "not op_mini all"],
-    "development": ["last 1 chrome version", "last 1 firefox version", "last 1 safari version"]
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
   }
 }

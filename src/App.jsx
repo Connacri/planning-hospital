@@ -1,33 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-
-// ══════════════════════════════════════════════
-//  CONFIG SUPABASE MCP
-// ══════════════════════════════════════════════
-const MCP_SERVER = {
-  type: "url",
-  url: "https://mcp.supabase.com/mcp?project_ref=yeswhmhlyjzjqcpawxbm",
-  name: "supabase",
-};
-
-async function supabaseAI(prompt) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 2000,
-      system: `Tu es un agent Supabase. Exécute les opérations demandées via les outils MCP disponibles.
-Réponds UNIQUEMENT avec du JSON valide, sans markdown, sans texte avant ou après.
-Format de réponse : {"ok":true,"rows":[...]} ou {"ok":false,"error":"..."}`,
-      messages: [{ role: "user", content: prompt }],
-      mcp_servers: [MCP_SERVER],
-    }),
-  });
-  const data = await res.json();
-  const text = (data.content || []).map(b => b.text || "").join("").trim();
-  try { return JSON.parse(text.replace(/```json|```/g, "").trim()); }
-  catch { return { ok: false, error: text }; }
-}
+import { supabase, hasSupabaseConfig, supabaseConfigError } from "./supabaseClient";
 
 // ══════════════════════════════════════════════
 //  CONSTANTES
@@ -60,6 +32,12 @@ const GROUPES_INIT = [
   { id:"hygiene",        label:"🧹 Hygiène",         subtitle:"Agents d'Hygiène — 12h", color:"#f59e0b", hasEquipe:false,
     membres:[{nom:"OULD ALI Nassima",grade:"Agent d'Hygiène",equipe:null},{nom:"FERHAT Mourad",grade:"Agent d'Hygiène",equipe:null}] },
 ];
+const GROUPE_IDS = GROUPES_INIT.map(({ id }) => id);
+const CHAT_PROVIDER = "anthropic";
+const CHAT_MODEL = "claude-sonnet-4-20250514";
+const CHAT_API_URL = "https://api.anthropic.com/v1/messages";
+const CHAT_API_VERSION = "2023-06-01";
+const CHAT_SETTINGS_TABLE = "service_ai_settings";
 
 // ══════════════════════════════════════════════
 //  HELPERS
@@ -71,6 +49,36 @@ const pad2    = n => String(n).padStart(2,"0");
 const today   = () => { const d=new Date(); return `${pad2(d.getDate())}/${pad2(d.getMonth()+1)}/${d.getFullYear()}`; };
 const ck      = (gid,mi,j) => `${gid}:${mi}:${j}`;
 const mnPfx   = mn => "aeiouâéèêîôûœ".includes(mn[0].toLowerCase())?"d'":"de ";
+const dbError = (error, fallback) => error?.message || error?.details || error?.hint || fallback;
+const chatKeyStorageKey = serviceId => `planningHospital.aiKey.${serviceId}`;
+const chatKeyPreview = value => value ? `${value.slice(0,7)}…${value.slice(-6)}` : "";
+
+function readLocalChatKey(serviceId) {
+  if (!serviceId || typeof window === "undefined") return "";
+  try { return window.localStorage.getItem(chatKeyStorageKey(serviceId)) || ""; }
+  catch { return ""; }
+}
+function writeLocalChatKey(serviceId, value) {
+  if (!serviceId || typeof window === "undefined") return;
+  try { window.localStorage.setItem(chatKeyStorageKey(serviceId), value); }
+  catch {}
+}
+function clearLocalChatKey(serviceId) {
+  if (!serviceId || typeof window === "undefined") return;
+  try { window.localStorage.removeItem(chatKeyStorageKey(serviceId)); }
+  catch {}
+}
+function isMissingRelationError(error) {
+  const msg = `${error?.message || ""} ${error?.details || ""}`.toLowerCase();
+  return error?.code === "PGRST205" || msg.includes("could not find the table") || msg.includes("does not exist");
+}
+
+function getSupabaseClient() {
+  if (!supabase || !hasSupabaseConfig) {
+    throw new Error(supabaseConfigError);
+  }
+  return supabase;
+}
 
 function equipeDebut(y,m,ordre) {
   const delta = (((y-1)*12+m) - ((2024-1)*12+1)) % 4;
@@ -86,6 +94,347 @@ function calcAutoGardes(y,m,membres,ordre) {
 }
 
 // ══════════════════════════════════════════════
+//  PDF — FONCTIONS COMMUNES
+// ══════════════════════════════════════════════
+
+/** En-tête institutionnel commun (HTML string) */
+function pdfHeader(svc, mn, year, subtitle, forLandscape = false) {
+  const fs = forLandscape ? 6 : 8;
+  const titleFs = forLandscape ? 8.5 : 12;
+  const subFs   = forLandscape ? 7   : 9;
+  return `
+    <div class="ph">
+      <div class="ph-rep" style="font-size:${fs}px">REPUBLIQUE ALGERIENNE DEMOCRATIQUE ET POPULAIRE</div>
+      <div class="ph-min" style="font-size:${fs}px">MINISTERE DE LA SANTE, DE LA POPULATION ET DE LA REFORME HOSPITALIERE</div>
+      <div class="ph-hosp" style="font-size:${fs + 1}px;font-weight:bold">${svc?.etablissement || ""}</div>
+    </div>
+    <div class="sigs-top">
+      <span>Le Médecin Chef</span>
+      <span class="unite">Unité : ${svc?.nom || ""}</span>
+      <span>Le Surveillant Médical DAPM</span>
+      <span>Le Directeur Général</span>
+    </div>
+    <div class="ptitle" style="font-size:${titleFs}px">
+      TABLEAU D'ACTIVITE ${mnPfx(mn).toUpperCase()}${mn.toUpperCase()} ${year}
+    </div>
+    <div class="psubtitle" style="font-size:${subFs}px">${subtitle}</div>
+  `;
+}
+
+/** Pied de page institutionnel (HTML string) */
+function pdfFooterSigs() {
+  return `
+    <div class="footer-sigs">
+      <span>Le Médecin Chef</span>
+      <span>Le Surveillant Médical DAPM</span>
+      <span>Le Directeur Général</span>
+    </div>
+  `;
+}
+
+/** Légende activités + date */
+function pdfLegend(svc) {
+  return `
+    <div class="leg">
+      <span>G&nbsp;:&nbsp;Garde &nbsp;&nbsp; RE&nbsp;:&nbsp;Récupération &nbsp;&nbsp; C&nbsp;:&nbsp;Congé &nbsp;&nbsp; CM&nbsp;:&nbsp;Congé Maladie &nbsp;&nbsp; N&nbsp;:&nbsp;Normal</span>
+      <span>Fait le&nbsp;:&nbsp;${today()}</span>
+    </div>
+    <div class="nb">N.B : Toutes modifications de programme ne doivent se faire qu'après accord de la direction</div>
+  `;
+}
+
+// CSS partagé pour les codes d'activité
+const ACT_CSS = `
+  .G  { background:#FFCDD2 !important; color:#B71C1C; font-weight:700; }
+  .RE { background:#FFF9C4 !important; color:#7B6000; font-weight:700; }
+  .C  { background:#C8E6C9 !important; color:#1B5E20; font-weight:700; }
+  .CM { background:#F8BBD0 !important; color:#880E4F; font-weight:700; }
+  .M  { background:#FCE4EC !important; color:#880E4F; font-weight:700; }
+  .F  { background:#E0F7FA !important; color:#006064; font-weight:700; }
+`;
+
+// ══════════════════════════════════════════════
+//  PDF 1 — LISTE DU PERSONNEL (PORTRAIT A4)
+// ══════════════════════════════════════════════
+function buildPdfListe(svc, groupes, year, month) {
+  const mn = MOIS_FR[month - 1];
+
+  // ── Génère une page portrait par groupe ──
+  const pages = groupes.map(gg => {
+    const obs = gg.hasEquipe ? "Équipe" : "Horaire";
+    const rows = gg.membres.map((m, mi) => `
+      <tr class="${mi % 2 === 1 ? 'alt' : ''}">
+        <td class="cn">${m.nom}</td>
+        <td class="cf">${m.grade}</td>
+        <td class="co">${m.equipe ? `Équipe ${m.equipe}` : (gg.subtitle.includes("12h") ? "07h-19h / 19h-07h" : "08h-16h")}</td>
+      </tr>
+    `).join("");
+
+    return `
+      <div class="page">
+        ${pdfHeader(svc, mn, year, gg.subtitle, false)}
+        <div class="tw">
+          <table>
+            <thead>
+              <tr>
+                <th class="hnom">Nom et Prénom</th>
+                <th class="hfn">Fonction</th>
+                <th class="hobs">${obs}</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div class="spacer"></div>
+        ${pdfFooterSigs()}
+      </div>
+    `;
+  }).join("");
+
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<style>
+  @page { size: A4 portrait; margin: 14mm 14mm 12mm 14mm; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 9px; color: #111; }
+
+  .page {
+    page-break-after: always;
+    display: flex;
+    flex-direction: column;
+    min-height: 265mm;
+  }
+  .page:last-child { page-break-after: auto; }
+
+  /* ── En-tête ── */
+  .ph { text-align: center; margin-bottom: 4px; }
+  .ph-rep { font-size: 7.5px; color: #222; }
+  .ph-min { font-size: 7.5px; color: #222; margin-top: 1px; }
+  .ph-hosp { font-size: 9px; font-weight: bold; color: #1B3A6B; margin-top: 3px; }
+
+  .sigs-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 7px;
+    color: #444;
+    border-top: 0.5px solid #1B3A6B;
+    border-bottom: 0.5px solid #1B3A6B;
+    padding: 3px 0;
+    margin-bottom: 5px;
+  }
+  .unite { font-weight: bold; font-size: 8px; color: #1B3A6B; }
+
+  .ptitle {
+    text-align: center;
+    font-weight: bold;
+    font-size: 12px;
+    color: #1B3A6B;
+    margin-bottom: 3px;
+    letter-spacing: 0.3px;
+  }
+  .psubtitle {
+    text-align: center;
+    font-size: 9px;
+    color: #2E5DA8;
+    font-weight: bold;
+    margin-bottom: 8px;
+    background: #EBF3FC;
+    padding: 3px;
+    border-radius: 2px;
+  }
+
+  /* ── Tableau ── */
+  .tw { flex: 1; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 0.4px solid #AAAAAA; padding: 5px 7px; }
+  thead tr { background: #1B3A6B; color: white; }
+  th { font-size: 9px; font-weight: bold; text-align: left; }
+  .hnom { width: 45%; }
+  .hfn  { width: 38%; }
+  .hobs { width: 17%; text-align: center; }
+  .cn { font-size: 9px; font-weight: 600; color: #1a1a1a; }
+  .cf { font-size: 8.5px; color: #333; }
+  .co { font-size: 8px; text-align: center; color: #2E5DA8; font-weight: bold; }
+  tr.alt td { background: #EBF3FC; }
+
+  /* ── Bas de page ── */
+  .spacer { flex: 1; }
+  .footer-sigs {
+    display: flex;
+    justify-content: space-around;
+    font-size: 8px;
+    color: #333;
+    border-top: 0.5px solid #1B3A6B;
+    padding-top: 6px;
+    margin-top: 10px;
+    padding-bottom: 5px;
+  }
+</style>
+</head>
+<body>${pages}</body>
+</html>`;
+}
+
+// ══════════════════════════════════════════════
+//  PDF 2 — PLANNING D'ACTIVITÉ (PAYSAGE A4)
+// ══════════════════════════════════════════════
+function buildPdfPlanning(svc, groupes, conges, year, month, ordre) {
+  const mn   = MOIS_FR[month - 1];
+  const days = getDays(year, month);
+
+  const pages = groupes.map(gg => {
+
+    // ── En-têtes colonnes jours ──
+    let dayHdrs = "";
+    for (let d = 1; d <= days; d++) {
+      const dw = getDow(year, month, d);
+      const we = isWE(dw);
+      dayHdrs += `<th class="dh${we ? " dwe" : ""}">${d}<br/><span>${JOURS_FR[dw]}</span></th>`;
+    }
+
+    // ── Lignes membres ──
+    const trows = gg.membres.map((m, mi) => {
+      let cells = `<td class="cn">${m.nom}</td><td class="cg">${m.grade}</td>`;
+      if (gg.hasEquipe) cells += `<td class="ce">${m.equipe || ""}</td>`;
+
+      for (let d = 1; d <= days; d++) {
+        const dw   = getDow(year, month, d);
+        const we   = isWE(dw);
+        const code = (conges[ck(gg.id, mi, d)] || "").toUpperCase();
+        const cls  = we ? "cday cwe" : `cday${code ? ` ${code}` : ""}`;
+        cells += `<td class="${cls}">${code}</td>`;
+      }
+      return `<tr>${cells}</tr>`;
+    }).join("");
+
+    const hasEqCol = gg.hasEquipe;
+
+    return `
+      <div class="page">
+        ${pdfHeader(svc, mn, year, gg.subtitle, true)}
+        <div class="tw">
+          <table>
+            <thead>
+              <tr>
+                <th class="hn-nom">Nom et Prénom</th>
+                <th class="hn-grd">Grade</th>
+                ${hasEqCol ? '<th class="hn-eq">Éq.</th>' : ""}
+                ${dayHdrs}
+              </tr>
+            </thead>
+            <tbody>${trows}</tbody>
+          </table>
+        </div>
+        ${pdfLegend(svc)}
+      </div>
+    `;
+  }).join("");
+
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<style>
+  @page { size: A4 landscape; margin: 9mm 11mm 9mm 11mm; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 6.5px; color: #111; }
+
+  .page {
+    page-break-after: always;
+    display: flex;
+    flex-direction: column;
+    min-height: 178mm;
+  }
+  .page:last-child { page-break-after: auto; }
+
+  /* ── En-tête ── */
+  .ph { text-align: center; margin-bottom: 2px; }
+  .ph-rep { font-size: 6px; color: #222; }
+  .ph-min { font-size: 6px; color: #222; margin-top: 1px; }
+  .ph-hosp { font-size: 7px; font-weight: bold; color: #1B3A6B; margin-top: 2px; }
+
+  .sigs-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 6px;
+    color: #444;
+    border-top: 0.5px solid #1B3A6B;
+    border-bottom: 0.5px solid #1B3A6B;
+    padding: 2px 0;
+    margin-bottom: 3px;
+  }
+  .unite { font-weight: bold; font-size: 7px; color: #1B3A6B; }
+
+  .ptitle {
+    text-align: center;
+    font-weight: bold;
+    font-size: 8.5px;
+    color: #1B3A6B;
+    margin-bottom: 1px;
+    letter-spacing: 0.2px;
+  }
+  .psubtitle {
+    text-align: center;
+    font-size: 7px;
+    color: #2E5DA8;
+    font-weight: bold;
+    margin-bottom: 4px;
+    background: #EBF3FC;
+    padding: 2px;
+  }
+
+  /* ── Tableau ── */
+  .tw { flex: 1; overflow: hidden; }
+  table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+  th, td { border: 0.25px solid #AAAAAA; text-align: center; vertical-align: middle; padding: 1px 0; overflow: hidden; }
+
+  /* Colonnes fixes */
+  .hn-nom { background:#1B3A6B; color:#fff; font-size:6px; width:90px; text-align:left; padding-left:3px; }
+  .hn-grd { background:#1B3A6B; color:#fff; font-size:6px; width:82px; text-align:left; padding-left:3px; }
+  .hn-eq  { background:#1B3A6B; color:#fff; font-size:6px; width:13px; }
+
+  /* Colonnes jours */
+  .dh     { background:#D6E4F7; color:#1B3A6B; font-weight:bold; font-size:5px; }
+  .dh span{ display:block; font-size:4.5px; }
+  .dwe    { background:#EDEDED; color:#555; }
+
+  /* Cellules données */
+  .cn { text-align:left; padding:1px 3px; font-size:6px; font-weight:bold; }
+  .cg { text-align:left; padding:1px 2px; font-size:5.5px; }
+  .ce { font-size:6px; font-weight:bold; color:#1B3A6B; }
+  .cday { font-size:6px; height:13px; }
+  .cwe  { background:#EDEDED; color:#777; }
+
+  /* Codes activité */
+  ${ACT_CSS}
+
+  /* Alternance lignes */
+  tbody tr:nth-child(even) td:not(.G):not(.RE):not(.C):not(.CM):not(.M):not(.F):not(.cwe) {
+    background: #EBF3FC;
+  }
+
+  /* ── Légende ── */
+  .leg {
+    display: flex;
+    justify-content: space-between;
+    font-size: 6px;
+    color: #333;
+    margin-top: 4px;
+    border-top: 0.3px solid #ccc;
+    padding-top: 3px;
+  }
+  .nb { font-size: 5.5px; color: #2E5DA8; margin-top: 2px; }
+</style>
+</head>
+<body>${pages}</body>
+</html>`;
+}
+
+// ══════════════════════════════════════════════
 //  APP
 // ══════════════════════════════════════════════
 export default function App() {
@@ -97,7 +446,7 @@ export default function App() {
   const [inputEtab,   setInputEtab]   = useState("Établissement");
   const [loginMsg,    setLoginMsg]    = useState("");
   const [loginBusy,   setLoginBusy]   = useState(false);
-  const [loginTab,    setLoginTab]    = useState("join"); // join | create
+  const [loginTab,    setLoginTab]    = useState("join");
 
   // ── PLANNING STATE ──
   const now = new Date();
@@ -117,12 +466,23 @@ export default function App() {
   const [msgs,     setMsgs]     = useState([{r:"a",t:"Bonjour ! 🏥 Connectez-vous pour commencer."}]);
   const [chatIn,   setChatIn]   = useState("");
   const [chatBusy, setChatBusy] = useState(false);
+  const [chatApiKey,      setChatApiKey]      = useState("");
+  const [chatApiKeyInput, setChatApiKeyInput] = useState("");
+  const [chatApiKeyBusy,  setChatApiKeyBusy]  = useState(false);
+  const [chatApiKeyMsg,   setChatApiKeyMsg]   = useState("");
+  const [chatApiKeySource,setChatApiKeySource]= useState("none");
+  const [showChatApiKey,  setShowChatApiKey]  = useState(false);
+  const [pdfMenu,  setPdfMenu]  = useState(false);
   const chatEnd = useRef(null);
 
-  const mn       = MOIS_FR[month-1];
-  const days     = getDays(year,month);
-  const g        = groupes[gi];
-  const eqDebut  = equipeDebut(year,month,ordre);
+  const mn      = MOIS_FR[month-1];
+  const days    = getDays(year,month);
+  const g       = groupes[gi];
+  const eqDebut = equipeDebut(year,month,ordre);
+  const chatReady = Boolean(chatApiKey.trim());
+  const chatStatusTone = chatReady
+    ? { bg:"rgba(34,197,94,.12)", border:"rgba(34,197,94,.35)", color:"#86efac" }
+    : { bg:"rgba(239,68,68,.10)", border:"rgba(239,68,68,.28)", color:"#fca5a5" };
 
   // Auto-gardes
   useEffect(()=>{
@@ -137,42 +497,109 @@ export default function App() {
     });
   },[year,month,ordre,autoMode]);
 
-  // ══════════════════════════════════════════════
-  //  LOGIN
-  // ══════════════════════════════════════════════
-  function doLogin(svc) {
-    setService(svc);
-    setLoggedIn(true);
-  }
+  useEffect(()=>{
+    let active = true;
+    async function loadChatApiKey() {
+      if(!service?.id){
+        if(active){
+          setChatApiKey("");
+          setChatApiKeyInput("");
+          setChatApiKeyMsg("");
+          setChatApiKeySource("none");
+        }
+        return;
+      }
 
-  function joinService() {
+      const localKey = readLocalChatKey(service.id);
+      if(active){
+        setChatApiKey(localKey);
+        setChatApiKeyInput(localKey);
+        setChatApiKeySource(localKey ? "local" : "none");
+        setChatApiKeyMsg("");
+      }
+
+      try{
+        const db = getSupabaseClient();
+        const { data, error } = await db
+          .from(CHAT_SETTINGS_TABLE)
+          .select("api_key")
+          .eq("service_id", service.id)
+          .eq("provider", CHAT_PROVIDER)
+          .maybeSingle();
+        if(error) throw error;
+        const remoteKey = data?.api_key || "";
+        if(!active || !remoteKey) return;
+        writeLocalChatKey(service.id, remoteKey);
+        setChatApiKey(remoteKey);
+        setChatApiKeyInput(remoteKey);
+        setChatApiKeySource("supabase");
+      }catch{
+        if(active && localKey){
+          setChatApiKeySource("local");
+        }
+      }
+    }
+    loadChatApiKey();
+    return ()=>{ active = false; };
+  },[service?.id]);
+
+  // ── LOGIN ──
+  function doLogin(svc) { setService(svc); setLoggedIn(true); setLoginMsg(""); }
+  async function joinService() {
     const code = inputCode.trim().toUpperCase();
     if (!code) { setLoginMsg("❌ Entrez un code."); return; }
-    // Service RHUMA01 hardcodé (déjà dans Supabase)
-    if (code === "RHUMA01") { doLogin(SERVICE_DEFAUT); return; }
-    // Autres : tentative MCP async
     setLoginBusy(true); setLoginMsg("⏳ Recherche…");
-    supabaseAI(`SELECT id,code,nom,etablissement FROM services WHERE code='${code}' LIMIT 1`)
-      .then(r=>{
-        if(r.ok && r.rows?.length>0) doLogin(r.rows[0]);
-        else setLoginMsg("❌ Service introuvable.");
-      })
-      .catch(()=>setLoginMsg("❌ Erreur réseau."))
-      .finally(()=>setLoginBusy(false));
+    try {
+      const db = getSupabaseClient();
+      const { data: existing, error } = await db
+        .from("services")
+        .select("id,code,nom,etablissement")
+        .eq("code", code)
+        .maybeSingle();
+      if (error) throw error;
+      if (existing) {
+        doLogin(existing);
+        return;
+      }
+      if (code === SERVICE_DEFAUT.code) {
+        const { data: created, error: createError } = await db
+          .from("services")
+          .upsert(SERVICE_DEFAUT, { onConflict: "code" })
+          .select("id,code,nom,etablissement")
+          .single();
+        if (createError) throw createError;
+        doLogin(created);
+        return;
+      }
+      setLoginMsg("❌ Service introuvable.");
+    } catch (error) {
+      setLoginMsg(`❌ ${dbError(error, "Erreur de connexion Supabase.")}`);
+    } finally {
+      setLoginBusy(false);
+    }
   }
-
-  function createService() {
+  async function createService() {
     const code=inputCode.trim().toUpperCase(), nom=inputNom.trim(), etab=inputEtab.trim();
     if(!code||!nom||!etab){ setLoginMsg("❌ Remplissez tous les champs."); return; }
-    // Créer localement d'abord, puis sauver en arrière-plan
-    const svc = { id: crypto.randomUUID(), code, nom, etablissement: etab };
-    doLogin(svc);
-    supabaseAI(`INSERT INTO services (id,code,nom,etablissement) VALUES ('${svc.id}','${code}','${nom}','${etab}') ON CONFLICT (code) DO NOTHING`).catch(()=>{});
+    setLoginBusy(true); setLoginMsg("⏳ Création du service…");
+    try {
+      const db = getSupabaseClient();
+      const svc = { id: crypto.randomUUID(), code, nom, etablissement: etab };
+      const { data, error } = await db
+        .from("services")
+        .upsert(svc, { onConflict: "code" })
+        .select("id,code,nom,etablissement")
+        .single();
+      if (error) throw error;
+      doLogin(data);
+    } catch (error) {
+      setLoginMsg(`❌ ${dbError(error, "Création impossible.")}`);
+    } finally {
+      setLoginBusy(false);
+    }
   }
 
-  // ══════════════════════════════════════════════
-  //  PLANNING
-  // ══════════════════════════════════════════════
+  // ── PLANNING ──
   function setCode(gid,mi,jour,v){
     setConges(prev=>{ const k=ck(gid,mi,jour),n={...prev}; if(!v||v===prev[k])delete n[k]; else n[k]=v.toUpperCase(); return n; });
   }
@@ -188,46 +615,263 @@ export default function App() {
     setSaving(true); setSaveMsg("⏳ Sauvegarde…");
     const rows=[];
     groupes.forEach(gg=>gg.membres.forEach((m,mi)=>{ for(let j=1;j<=days;j++){ const c=conges[ck(gg.id,mi,j)]; if(c)rows.push({gid:gg.id,mi,nom:m.nom,eq:m.equipe,j,c}); } }));
-    const prompt=`
-Pour le service_id='${service.id}', annee=${year}, mois=${month} :
-1. Pour chaque groupe parmi [medecins,administratifs,paramedical,hygiene], fais un UPSERT dans plannings (service_id,annee,mois,groupe_id,ordre_equipes,updated_at=now()) ON CONFLICT DO UPDATE, récupère l'id.
-2. DELETE FROM conges WHERE planning_id IN (les ids récupérés).
-3. INSERT INTO conges ces entrées : ${JSON.stringify(rows.map(r=>({planning_id:'__'+r.gid,membre_index:r.mi,membre_nom:r.nom,membre_equipe:r.eq,jour:r.j,code:r.c,is_auto:autoMode&&r.gid==="paramedical"&&r.c==="G"})))}
-4. UPSERT rotation_state (service_id,annee,mois,equipe_debut='${eqDebut}',ordre_equipes).
-Retourne {"ok":true,"n":${rows.length}}`;
-    const res=await supabaseAI(prompt).catch(()=>({ok:false}));
-    setSaveMsg(res.ok?`✅ ${rows.length} codes sauvegardés`:"❌ Erreur sauvegarde");
-    setSaving(false);
+    try {
+      const db = getSupabaseClient();
+      const updatedAt = new Date().toISOString();
+      const planningPayload = GROUPE_IDS.map(groupeId => ({
+        service_id: service.id,
+        annee: year,
+        mois: month,
+        groupe_id: groupeId,
+        ordre_equipes: ordre,
+        updated_at: updatedAt,
+      }));
+
+      const { data: planningRows, error: planningError } = await db
+        .from("plannings")
+        .upsert(planningPayload, { onConflict: "service_id,annee,mois,groupe_id" })
+        .select("id,groupe_id");
+      if (planningError) throw planningError;
+
+      const planningIdByGroup = Object.fromEntries((planningRows || []).map(row => [row.groupe_id, row.id]));
+      const planningIds = Object.values(planningIdByGroup);
+
+      if (planningIds.length > 0) {
+        const { error: deleteError } = await db
+          .from("conges")
+          .delete()
+          .in("planning_id", planningIds);
+        if (deleteError) throw deleteError;
+      }
+
+      const congesPayload = rows
+        .map(r => {
+          const planningId = planningIdByGroup[r.gid];
+          if (!planningId) return null;
+          return {
+            planning_id: planningId,
+            membre_index: r.mi,
+            membre_nom: r.nom,
+            membre_equipe: r.eq,
+            jour: r.j,
+            code: r.c,
+            is_auto: autoMode && r.gid === "paramedical" && r.c === "G",
+          };
+        })
+        .filter(Boolean);
+
+      if (congesPayload.length > 0) {
+        const { error: insertError } = await db.from("conges").insert(congesPayload);
+        if (insertError) throw insertError;
+      }
+
+      const { error: rotationError } = await db
+        .from("rotation_state")
+        .upsert({
+          service_id: service.id,
+          annee: year,
+          mois: month,
+          equipe_debut: eqDebut,
+          ordre_equipes: ordre,
+        }, { onConflict: "service_id,annee,mois" });
+      if (rotationError) throw rotationError;
+
+      setSaveMsg(`✅ ${rows.length} codes sauvegardés`);
+    } catch (error) {
+      setSaveMsg(`❌ ${dbError(error, "Erreur sauvegarde")}`);
+    } finally {
+      setSaving(false);
+    }
   }
 
   // Historique
   const loadHisto=useCallback(async()=>{
     if(!service)return; setHistoBusy(true);
-    const r=await supabaseAI(`SELECT * FROM plannings WHERE service_id='${service.id}' ORDER BY annee DESC,mois DESC`).catch(()=>({ok:false,rows:[]}));
-    setHisto(r.rows||[]); setHistoBusy(false);
+    try {
+      const db = getSupabaseClient();
+      const { data, error } = await db
+        .from("plannings")
+        .select("id,annee,mois,groupe_id,updated_at")
+        .eq("service_id", service.id)
+        .order("annee", { ascending: false })
+        .order("mois", { ascending: false });
+      if (error) throw error;
+      setHisto(data || []);
+    } catch {
+      setHisto([]);
+    } finally {
+      setHistoBusy(false);
+    }
   },[service]);
   useEffect(()=>{ if(tab==="historique")loadHisto(); },[tab,loadHisto]);
 
   async function loadPlan(annee,mois){
     addA("⏳ Chargement…");
-    const r=await supabaseAI(`
-SELECT p.id,p.groupe_id,p.ordre_equipes,c.membre_index,c.membre_nom,c.membre_equipe,c.jour,c.code
-FROM plannings p JOIN conges c ON c.planning_id=p.id
-WHERE p.service_id='${service.id}' AND p.annee=${annee} AND p.mois=${mois}`).catch(()=>({ok:false,rows:[]}));
-    if(!r.ok||!r.rows?.length){addA("❌ Aucune donnée trouvée.");return;}
-    const nc={};
-    r.rows.forEach(row=>{ nc[ck(row.groupe_id,row.membre_index,row.jour)]=row.code; if(row.ordre_equipes)setOrdre(row.ordre_equipes); });
-    setConges(nc); setYear(annee); setMonth(mois); setAutoMode(false); setTab("planning");
-    addA(`📂 Planning ${MOIS_FR[mois-1]} ${annee} chargé.`);
+    try {
+      const db = getSupabaseClient();
+      const { data: planningRows, error: planningError } = await db
+        .from("plannings")
+        .select("id,groupe_id,ordre_equipes")
+        .eq("service_id", service.id)
+        .eq("annee", annee)
+        .eq("mois", mois);
+      if (planningError) throw planningError;
+      if (!planningRows?.length) { addA("❌ Aucun planning trouvé."); return; }
+
+      const planningIds = planningRows.map(row => row.id);
+      const planningGroupById = Object.fromEntries(planningRows.map(row => [row.id, row.groupe_id]));
+      const storedOrdre = planningRows.find(row => Array.isArray(row.ordre_equipes) && row.ordre_equipes.length)?.ordre_equipes;
+
+      let congesRows = [];
+      if (planningIds.length > 0) {
+        const { data, error } = await db
+          .from("conges")
+          .select("planning_id,membre_index,membre_nom,membre_equipe,jour,code")
+          .in("planning_id", planningIds);
+        if (error) throw error;
+        congesRows = data || [];
+      }
+
+      const nc={};
+      congesRows.forEach(row=>{
+        const groupeId = planningGroupById[row.planning_id];
+        if (groupeId) nc[ck(groupeId,row.membre_index,row.jour)]=row.code;
+      });
+
+      if (storedOrdre) {
+        setOrdre(storedOrdre);
+      } else {
+        const { data: rotationRow, error: rotationError } = await db
+          .from("rotation_state")
+          .select("ordre_equipes")
+          .eq("service_id", service.id)
+          .eq("annee", annee)
+          .eq("mois", mois)
+          .maybeSingle();
+        if (rotationError) throw rotationError;
+        if (Array.isArray(rotationRow?.ordre_equipes) && rotationRow.ordre_equipes.length) {
+          setOrdre(rotationRow.ordre_equipes);
+        }
+      }
+
+      setConges(nc); setYear(annee); setMonth(mois); setAutoMode(false); setTab("planning");
+      addA(`📂 Planning ${MOIS_FR[mois-1]} ${annee} chargé.`);
+    } catch (error) {
+      addA(`❌ ${dbError(error, "Chargement impossible.")}`);
+    }
   }
   async function delPlan(annee,mois){
-    await supabaseAI(`DELETE FROM plannings WHERE service_id='${service.id}' AND annee=${annee} AND mois=${mois}`).catch(()=>{});
-    addA(`🗑️ Supprimé.`); loadHisto();
+    try {
+      const db = getSupabaseClient();
+      const { data: planningRows, error: planningError } = await db
+        .from("plannings")
+        .select("id")
+        .eq("service_id", service.id)
+        .eq("annee", annee)
+        .eq("mois", mois);
+      if (planningError) throw planningError;
+
+      const planningIds = (planningRows || []).map(row => row.id);
+      if (planningIds.length > 0) {
+        const { error: deleteCongesError } = await db
+          .from("conges")
+          .delete()
+          .in("planning_id", planningIds);
+        if (deleteCongesError) throw deleteCongesError;
+      }
+
+      const { error: deleteRotationError } = await db
+        .from("rotation_state")
+        .delete()
+        .eq("service_id", service.id)
+        .eq("annee", annee)
+        .eq("mois", mois);
+      if (deleteRotationError) throw deleteRotationError;
+
+      const { error: deletePlanningError } = await db
+        .from("plannings")
+        .delete()
+        .eq("service_id", service.id)
+        .eq("annee", annee)
+        .eq("mois", mois);
+      if (deletePlanningError) throw deletePlanningError;
+
+      addA("🗑️ Supprimé.");
+      loadHisto();
+    } catch (error) {
+      addA(`❌ ${dbError(error, "Suppression impossible.")}`);
+    }
   }
 
   // Chat
   function addA(t){ setMsgs(p=>[...p,{r:"a",t}]); }
+  async function saveChatApiKey(){
+    const nextKey = chatApiKeyInput.trim();
+    if(!nextKey){ setChatApiKeyMsg("❌ Entrez une clé API Anthropic."); return; }
+    if(!service?.id){ setChatApiKeyMsg("❌ Aucun service actif."); return; }
+
+    setChatApiKeyBusy(true);
+    setChatApiKeyMsg("⏳ Sauvegarde de la clé…");
+    writeLocalChatKey(service.id, nextKey);
+    setChatApiKey(nextKey);
+    setChatApiKeySource("local");
+
+    try{
+      const db = getSupabaseClient();
+      const { error } = await db
+        .from(CHAT_SETTINGS_TABLE)
+        .upsert({
+          service_id: service.id,
+          provider: CHAT_PROVIDER,
+          api_key: nextKey,
+          api_key_hint: chatKeyPreview(nextKey),
+          updated_at: new Date().toISOString(),
+        }, { onConflict: "service_id,provider" });
+      if(error) throw error;
+      setChatApiKeySource("supabase");
+      setChatApiKeyMsg("✅ Clé API sauvée localement et synchronisée dans Supabase.");
+    }catch(error){
+      if(isMissingRelationError(error)){
+        setChatApiKeyMsg("⚠️ Clé API sauvée localement. La table service_ai_settings manque encore dans Supabase.");
+      }else{
+        setChatApiKeyMsg(`⚠️ Clé API sauvée localement. Sync Supabase indisponible: ${dbError(error, "erreur inconnue")}`);
+      }
+    }finally{
+      setChatApiKeyBusy(false);
+    }
+  }
+  async function clearChatApiKey(){
+    if(!service?.id) return;
+
+    setChatApiKeyBusy(true);
+    setChatApiKeyMsg("⏳ Suppression de la clé…");
+    clearLocalChatKey(service.id);
+    setChatApiKey("");
+    setChatApiKeyInput("");
+    setChatApiKeySource("none");
+    setShowChatApiKey(false);
+
+    try{
+      const db = getSupabaseClient();
+      const { error } = await db
+        .from(CHAT_SETTINGS_TABLE)
+        .delete()
+        .eq("service_id", service.id)
+        .eq("provider", CHAT_PROVIDER);
+      if(error) throw error;
+      setChatApiKeyMsg("🗑️ Clé API supprimée localement et dans Supabase.");
+    }catch(error){
+      if(isMissingRelationError(error)){
+        setChatApiKeyMsg("🗑️ Clé API supprimée localement.");
+      }else{
+        setChatApiKeyMsg(`⚠️ Clé locale supprimée. Suppression Supabase impossible: ${dbError(error, "erreur inconnue")}`);
+      }
+    }finally{
+      setChatApiKeyBusy(false);
+    }
+  }
   async function sendChat(){
+    if(!chatReady){ setChatApiKeyMsg("❌ Configurez une clé API Anthropic avant d'utiliser le chat."); return; }
     if(!chatIn.trim()||chatBusy)return;
     const txt=chatIn.trim(); setChatIn(""); setMsgs(p=>[...p,{r:"u",t:txt}]); setChatBusy(true);
     const ctx={annee:year,mois:month,nomMois:mn,service:service?.nom,equipeDebut:eqDebut,ordreRotation:ordre,
@@ -235,15 +879,21 @@ WHERE p.service_id='${service.id}' AND p.annee=${annee} AND p.mois=${mois}`).cat
         conges:Object.entries(conges).filter(([k])=>k.startsWith(`${gg.id}:${mi}:`)).map(([k,v])=>({jour:+k.split(":")[2],code:v})),
       }))}))};
     try{
-      const res=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:800,
+      const res=await fetch(CHAT_API_URL,{method:"POST",headers:{
+          "Content-Type":"application/json",
+          "anthropic-version":CHAT_API_VERSION,
+          "anthropic-dangerous-direct-browser-access":"true",
+          "x-api-key":chatApiKey.trim(),
+        },
+        body:JSON.stringify({model:CHAT_MODEL,max_tokens:800,
           system:`Agent planning hospitalier — ${service?.etablissement}. CONTEXTE:${JSON.stringify(ctx)}
 CODES:G=Garde RE=Récup C=Congé CM=Maladie M=Maternité N=Normal F=Férié
 IDs:medecins|administratifs|paramedical|hygiene
 Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":5,"code":"C"}],"msg":"..."}
-Sinon→JSON:{"action":"msg","msg":"..."}`,
+          Sinon→JSON:{"action":"msg","msg":"..."}`,
           messages:[{role:"user",content:txt}]})});
       const d=await res.json();
+      if(!res.ok) throw new Error(d?.error?.message || `Erreur Anthropic (${res.status})`);
       const raw=(d.content||[]).map(b=>b.text||"").join("");
       let p; try{p=JSON.parse(raw.replace(/```json|```/g,"").trim())}catch{p={action:"msg",msg:raw}}
       if(p.action==="update"&&p.updates){applyIA(p.updates);addA("✅ "+p.msg);}else addA(p.msg||raw);
@@ -252,42 +902,28 @@ Sinon→JSON:{"action":"msg","msg":"..."}`,
     setTimeout(()=>chatEnd.current?.scrollIntoView({behavior:"smooth"}),100);
   }
 
-  // PDF
-  function pdf(){
-    const win=window.open("","_blank");
-    const MU=mn.toUpperCase(),PU=mnPfx(mn).toUpperCase();
-    const pages=groupes.map(gg=>{
-      let h=`<th class="hn">Nom et Prénom</th><th class="hn">Grade</th>`;
-      if(gg.hasEquipe)h+=`<th class="hn">Éq.</th>`;
-      for(let d=1;d<=days;d++){const dw=getDow(year,month,d);h+=`<th class="${isWE(dw)?"dw":"dh"}">${d}<br/><span>${JOURS_FR[dw].slice(0,2)}</span></th>`;}
-      const rows=gg.membres.map((m,mi)=>{
-        let c=`<td class="cn">${m.nom}</td><td class="cg">${m.grade}</td>`;
-        if(gg.hasEquipe)c+=`<td class="ce">${m.equipe||"-"}</td>`;
-        for(let d=1;d<=days;d++){const dw=getDow(year,month,d);c+=`<td class="${isWE(dw)?"cw":"cc"}">${conges[ck(gg.id,mi,d)]||""}</td>`;}
-        return `<tr>${c}</tr>`;
-      }).join("");
-      return `<div class="page"><div class="ph"><b>RÉPUBLIQUE ALGÉRIENNE DÉMOCRATIQUE ET POPULAIRE</b><br/>MINISTÈRE DE LA SANTÉ, DE LA POPULATION ET DE LA RÉFORME HOSPITALIÈRE<br/>${service?.etablissement||""}</div>
-<div class="unite">Service : ${service?.nom||""}</div>
-<div class="ptitle">TABLEAU D'ACTIVITÉ ${PU}${MU} ${year} | ${gg.subtitle}</div>
-<div class="tw"><table><thead><tr>${h}</tr></thead><tbody>${rows}</tbody></table></div>
-<div class="leg">G:Garde RE:Récupération C:Congé CM:Congé Maladie M:Maternité N:Normal F:Férié<span>Fait le ${today()}</span></div>
-<div class="nb">Rotation : ${ordre.join("→")} — Début équipe ${eqDebut}</div>
-<div class="sigs"><span>Le Médecin Chef</span><span>Le Surveillant Médical</span><span>DAPM</span><span>Le Directeur Général</span></div></div>`;
-    }).join("");
-    win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"/><style>
-@page{size:A4 landscape;margin:9mm 11mm}*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',Arial,sans-serif;font-size:7.5px}
-.page{page-break-after:always;display:flex;flex-direction:column;min-height:196mm}.page:last-child{page-break-after:auto}
-.ph{text-align:center;margin-bottom:5px;font-size:8px}.ph b{font-size:9px}.unite{font-size:8.5px;margin-bottom:3px}
-.ptitle{text-align:center;font-weight:bold;font-size:9.5px;margin-bottom:5px}.tw{overflow:hidden;flex:1}
-table{border-collapse:collapse;width:100%;table-layout:fixed}th,td{border:.3px solid #888;text-align:center;vertical-align:middle;padding:1px 0}
-.hn{background:#ccc;font-weight:bold;font-size:7px;width:85px}.dh{background:#ccc;font-weight:bold;font-size:6.5px;width:15px}
-.dw{background:#111;color:#fff;font-weight:bold;font-size:6.5px;width:15px}.dh span,.dw span{font-size:6px;display:block}
-.cn{text-align:left;padding:1px 3px;font-size:7px;font-weight:bold}.cg{text-align:left;padding:1px 2px;font-size:6.5px}
-.ce{font-size:7px;width:20px}.cc{font-size:7px;height:13px;width:15px}.cw{background:#222;color:#fff;font-size:7px;height:13px;width:15px}
-.leg{font-size:6.5px;margin-top:5px;display:flex;justify-content:space-between}.nb{font-size:6.5px;margin-top:2px}
-.sigs{display:flex;justify-content:space-around;margin-top:28px;font-size:7px;padding-bottom:15px}
-</style></head><body>${pages}</body></html>`);
-    win.document.close(); setTimeout(()=>win.print(),600);
+  // ══════════════════════════════════════════════
+  //  PDF — DÉCLENCHEURS
+  // ══════════════════════════════════════════════
+
+  /** PDF Liste du Personnel — Portrait A4 */
+  function openPdfListe() {
+    setPdfMenu(false);
+    const html = buildPdfListe(service, groupes, year, month);
+    const win = window.open("", "_blank");
+    win.document.write(html);
+    win.document.close();
+    setTimeout(() => win.print(), 700);
+  }
+
+  /** PDF Planning d'Activité — Paysage A4 */
+  function openPdfPlanning() {
+    setPdfMenu(false);
+    const html = buildPdfPlanning(service, groupes, conges, year, month, ordre);
+    const win = window.open("", "_blank");
+    win.document.write(html);
+    win.document.close();
+    setTimeout(() => win.print(), 700);
   }
 
   // ══════════════════════════════════════════════
@@ -301,7 +937,6 @@ table{border-collapse:collapse;width:100%;table-layout:fixed}th,td{border:.3px s
         <div style={{fontSize:12,color:"#475569",marginTop:4}}>Plateforme SaaS · Supabase <span style={{color:"#22c55e"}}>●</span></div>
       </div>
 
-      {/* Tabs join/create */}
       <div style={{display:"flex",gap:0,background:"rgba(255,255,255,.05)",borderRadius:10,padding:4,width:"100%",maxWidth:400}}>
         {[["join","🔑 Rejoindre"],["create","✨ Créer"]].map(([id,lbl])=>(
           <button key={id} onClick={()=>{setLoginTab(id);setLoginMsg("");}} style={{
@@ -329,17 +964,14 @@ table{border-collapse:collapse;width:100%;table-layout:fixed}th,td{border:.3px s
         </> : <>
           <input value={inputCode} onChange={e=>setInputCode(e.target.value.toUpperCase())} placeholder="Code (ex: CARDIO01)"
             style={{...FLD,textTransform:"uppercase"}}/>
-          <input value={inputNom} onChange={e=>setInputNom(e.target.value)} placeholder="Nom du service"
-            style={FLD}/>
-          <input value={inputEtab} onChange={e=>setInputEtab(e.target.value)} placeholder="Établissement"
-            style={FLD}/>
+          <input value={inputNom} onChange={e=>setInputNom(e.target.value)} placeholder="Nom du service" style={FLD}/>
+          <input value={inputEtab} onChange={e=>setInputEtab(e.target.value)} placeholder="Établissement" style={FLD}/>
           <button onClick={createService} disabled={loginBusy} style={{
             padding:"13px",borderRadius:8,border:"none",cursor:"pointer",fontSize:14,fontWeight:700,
             background:"linear-gradient(135deg,#059669,#0891b2)",color:"white",marginTop:4,
             opacity:loginBusy?0.7:1,
           }}>{loginBusy?"⏳ Création…":"✨ Créer ce service"}</button>
         </>}
-
         {loginMsg&&<div style={{padding:"8px 12px",borderRadius:8,background:"rgba(239,68,68,.1)",border:"1px solid rgba(239,68,68,.3)",color:"#fca5a5",fontSize:12,textAlign:"center"}}>{loginMsg}</div>}
       </div>
 
@@ -369,9 +1001,44 @@ table{border-collapse:collapse;width:100%;table-layout:fixed}th,td{border:.3px s
         <div style={{padding:"3px 10px",borderRadius:20,background:"rgba(239,68,68,.12)",border:"1px solid #ef444430",fontSize:10,color:"#fca5a5"}}>
           🔄 {mn.slice(0,3)}. → Éq.<b style={{marginLeft:4}}>{eqDebut}</b>
         </div>
-        <div style={{marginLeft:"auto",display:"flex",gap:6}}>
+        <div style={{marginLeft:"auto",display:"flex",gap:6,alignItems:"center",position:"relative"}}>
           <button onClick={save} disabled={saving} style={{...BTN,background:"linear-gradient(135deg,#059669,#0891b2)",fontSize:11}}>{saving?"⏳…":"💾 Sauver"}</button>
-          <button onClick={pdf} style={{...BTN,background:"linear-gradient(135deg,#7c3aed,#1d4ed8)",fontSize:11}}>📄 PDF</button>
+
+          {/* ── Menu PDF ── */}
+          <div style={{position:"relative"}}>
+            <button
+              onClick={()=>setPdfMenu(p=>!p)}
+              style={{...BTN,background:"linear-gradient(135deg,#7c3aed,#1d4ed8)",fontSize:11}}
+            >
+              📄 PDF ▾
+            </button>
+            {pdfMenu && (
+              <div style={{
+                position:"absolute",right:0,top:"110%",zIndex:100,
+                background:"#0f1d35",border:"1px solid rgba(255,255,255,.12)",
+                borderRadius:8,overflow:"hidden",minWidth:180,
+                boxShadow:"0 8px 32px rgba(0,0,0,.5)",
+              }}>
+                <button onClick={openPdfListe} style={{
+                  display:"block",width:"100%",padding:"10px 16px",border:"none",
+                  background:"transparent",color:"#e2e8f0",fontSize:12,textAlign:"left",
+                  cursor:"pointer",borderBottom:"1px solid rgba(255,255,255,.06)",
+                }}>
+                  📋 Liste du Personnel
+                  <div style={{fontSize:10,color:"#475569",marginTop:2}}>Portrait A4 · 1 page / groupe</div>
+                </button>
+                <button onClick={openPdfPlanning} style={{
+                  display:"block",width:"100%",padding:"10px 16px",border:"none",
+                  background:"transparent",color:"#e2e8f0",fontSize:12,textAlign:"left",
+                  cursor:"pointer",
+                }}>
+                  📅 Planning d'Activité
+                  <div style={{fontSize:10,color:"#475569",marginTop:2}}>Paysage A4 · Tableau 31 jours</div>
+                </button>
+              </div>
+            )}
+          </div>
+
           <button onClick={()=>{setLoggedIn(false);setService(null);}} style={{...BTN,background:"rgba(255,255,255,.05)",color:"#64748b",fontSize:11}}>⬅</button>
         </div>
       </div>
@@ -396,7 +1063,7 @@ table{border-collapse:collapse;width:100%;table-layout:fixed}th,td{border:.3px s
       </div>
 
       {/* ── CONTENU ── */}
-      <div style={{flex:1,overflow:"hidden",display:"flex"}}>
+      <div style={{flex:1,overflow:"hidden",display:"flex"}} onClick={()=>pdfMenu&&setPdfMenu(false)}>
 
         {tab==="planning"&&(
           <div style={{flex:1,padding:16,overflowY:"auto"}}>
@@ -514,6 +1181,68 @@ table{border-collapse:collapse;width:100%;table-layout:fixed}th,td{border:.3px s
 
         {tab==="chat"&&(
           <div style={{flex:1,display:"flex",flexDirection:"column",padding:16}}>
+            <div style={{marginBottom:12,background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.08)",borderRadius:10,padding:14}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:10}}>
+                <div>
+                  <div style={{fontSize:12,fontWeight:700,color:"#93c5fd"}}>Clé API Anthropic</div>
+                  <div style={{fontSize:10,color:"#475569",marginTop:2}}>
+                    {chatReady ? `Configurée · ${chatKeyPreview(chatApiKey)}` : "Aucune clé configurée"}
+                    {chatApiKeySource==="supabase" ? " · source Supabase" : chatApiKeySource==="local" ? " · source locale" : ""}
+                  </div>
+                </div>
+                <div style={{padding:"5px 10px",borderRadius:999,border:`1px solid ${chatStatusTone.border}`,background:chatStatusTone.bg,color:chatStatusTone.color,fontSize:10,fontWeight:700}}>
+                  {chatReady ? "● Clé active" : "● Clé requise"}
+                </div>
+              </div>
+
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                <div style={{flex:"1 1 320px",display:"flex",gap:6}}>
+                  <input
+                    type={showChatApiKey ? "text" : "password"}
+                    value={chatApiKeyInput}
+                    onChange={e=>setChatApiKeyInput(e.target.value)}
+                    placeholder="sk-ant-..."
+                    style={{...INP,flex:1,padding:"9px 11px",fontFamily:"monospace"}}
+                  />
+                  <button
+                    onClick={()=>setShowChatApiKey(v=>!v)}
+                    type="button"
+                    style={{...BTN,background:"rgba(255,255,255,.05)",color:"#cbd5e1",padding:"0 10px"}}
+                  >
+                    {showChatApiKey ? "Masquer" : "Afficher"}
+                  </button>
+                </div>
+                <button
+                  onClick={saveChatApiKey}
+                  disabled={chatApiKeyBusy}
+                  style={{...BTN,background:"linear-gradient(135deg,#2563eb,#0891b2)",fontSize:11}}
+                >
+                  {chatApiKeyBusy ? "⏳…" : "Sauver"}
+                </button>
+                <button
+                  onClick={clearChatApiKey}
+                  disabled={chatApiKeyBusy && !chatReady}
+                  style={{...BTN,background:"rgba(239,68,68,.12)",color:"#fca5a5",fontSize:12,padding:"6px 10px"}}
+                  title="Effacer la clé"
+                >
+                  ✕
+                </button>
+                <a
+                  href="https://console.anthropic.com/"
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{fontSize:11,color:"#60a5fa",textDecoration:"none"}}
+                >
+                  Obtenir une clé
+                </a>
+              </div>
+
+              <div style={{fontSize:10,color:"#475569",marginTop:8}}>
+                Le bouton Sauver persiste la clé dans `localStorage`, puis tente une synchronisation Supabase si la table dédiée existe.
+              </div>
+              {chatApiKeyMsg&&<div style={{marginTop:10,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.06)",fontSize:11,color:"#cbd5e1"}}>{chatApiKeyMsg}</div>}
+            </div>
+
             <div style={{flex:1,overflowY:"auto",display:"flex",flexDirection:"column",gap:10,paddingBottom:10}}>
               {msgs.map((m,i)=>(
                 <div key={i} style={{display:"flex",justifyContent:m.r==="u"?"flex-end":"flex-start"}}>
@@ -531,8 +1260,15 @@ table{border-collapse:collapse;width:100%;table-layout:fixed}th,td{border:.3px s
               ))}
             </div>
             <div style={{display:"flex",gap:7,background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.07)",borderRadius:8,padding:"7px 10px"}}>
-              <input value={chatIn} onChange={e=>setChatIn(e.target.value)} onKeyDown={e=>e.key==="Enter"&&sendChat()} placeholder="Parlez à l'agent…" style={{flex:1,background:"transparent",border:"none",color:"#e2e8f0",fontSize:12,outline:"none"}}/>
-              <button onClick={sendChat} disabled={chatBusy||!chatIn.trim()} style={{...BTN,fontSize:11,background:chatBusy||!chatIn.trim()?"rgba(255,255,255,.04)":"linear-gradient(135deg,#1d4ed8,#0891b2)",color:chatBusy||!chatIn.trim()?"#475569":"white"}}>{chatBusy?"…":"↵"}</button>
+              <input
+                value={chatIn}
+                onChange={e=>setChatIn(e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&sendChat()}
+                disabled={!chatReady}
+                placeholder={chatReady ? "Parlez à l'agent…" : "Configurez une clé API Anthropic pour activer le chat"}
+                style={{flex:1,background:"transparent",border:"none",color:chatReady?"#e2e8f0":"#64748b",fontSize:12,outline:"none"}}
+              />
+              <button onClick={sendChat} disabled={!chatReady||chatBusy||!chatIn.trim()} style={{...BTN,fontSize:11,background:!chatReady||chatBusy||!chatIn.trim()?"rgba(255,255,255,.04)":"linear-gradient(135deg,#1d4ed8,#0891b2)",color:!chatReady||chatBusy||!chatIn.trim()?"#475569":"white"}}>{chatBusy?"…":"↵"}</button>
             </div>
           </div>
         )}
