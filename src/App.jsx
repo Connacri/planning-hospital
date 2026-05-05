@@ -22,17 +22,7 @@ const CODES = [
   { code:"N",  label:"Normal",        color:"#22c55e" },
   { code:"F",  label:"Férié",         color:"#06b6d4" },
 ];
-const GROUPES_INIT = [
-  { id:"medecins",       label:"👨‍⚕️ Médecins",     subtitle:"08h–16h — Personnel Médical", color:"#3b82f6", hasEquipe:false,
-    membres:[{nom:"Dr. BENALI Karim",grade:"Médecin Rhumatologue",equipe:null},{nom:"Dr. MAMMERI Salima",grade:"Médecin Généraliste",equipe:null},{nom:"Dr. KACI Omar",grade:"Médecin Spécialiste",equipe:null}] },
-  { id:"administratifs", label:"🗂️ Administration", subtitle:"08h–16h", color:"#8b5cf6", hasEquipe:false,
-    membres:[{nom:"BOUZIANE Karima",grade:"Secrétaire Médicale",equipe:null},{nom:"MEDJDOUB Sofiane",grade:"Technicien Adm.",equipe:null},{nom:"RAIS Houria",grade:"Aide Soignante",equipe:null}] },
-  { id:"paramedical",    label:"🏥 Paramédical",    subtitle:"24h", color:"#10b981", hasEquipe:true,
-    membres:[{nom:"HAMDI Nadia",grade:"Infirmier Principal",equipe:"A"},{nom:"MEZIANI Youcef",grade:"Infirmier",equipe:"B"},{nom:"BRAHIMI Fatima",grade:"Infirmière",equipe:"C"},{nom:"AISSAOUI Rachid",grade:"Infirmier",equipe:"D"}] },
-  { id:"hygiene",        label:"🧹 Hygiène",         subtitle:"Agents d'Hygiène — 12h", color:"#f59e0b", hasEquipe:false,
-    membres:[{nom:"OULD ALI Nassima",grade:"Agent d'Hygiène",equipe:null},{nom:"FERHAT Mourad",grade:"Agent d'Hygiène",equipe:null}] },
-];
-const GROUPE_IDS = GROUPES_INIT.map(({ id }) => id);
+const DEFAULT_ROTATION_ORDER = ["A","B","C","D"];
 const CHAT_PROVIDER  = "gemini";
 const CHAT_MODEL     = "gemini-2.0-flash";
 const CHAT_API_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`;
@@ -50,23 +40,51 @@ const today   = () => { const d=new Date(); return `${pad2(d.getDate())}/${pad2(
 const ck      = (gid,mi,j) => `${gid}:${mi}:${j}`;
 const mnPfx   = mn => "aeiouâéèêîôûœ".includes(mn[0].toLowerCase())?"d'":"de ";
 const dbError = (error, fallback) => error?.message || error?.details || error?.hint || fallback;
-const chatKeyStorageKey = serviceId => `planningHospital.aiKey.${serviceId}`;
 const chatKeyPreview = value => value ? `${value.slice(0,7)}…${value.slice(-6)}` : "";
 
-function readLocalChatKey(serviceId) {
-  if (!serviceId || typeof window === "undefined") return "";
-  try { return window.localStorage.getItem(chatKeyStorageKey(serviceId)) || ""; }
-  catch { return ""; }
+function mapServiceData(groupRows, memberRows) {
+  const membersByGroupId = {};
+  (memberRows || []).forEach(row => {
+    if (!membersByGroupId[row.group_id]) membersByGroupId[row.group_id] = [];
+    membersByGroupId[row.group_id].push(row);
+  });
+
+  return (groupRows || []).map(row => ({
+    id: row.code,
+    dbId: row.id,
+    label: row.label,
+    subtitle: row.subtitle,
+    color: row.color,
+    hasEquipe: row.has_equipe,
+    membres: (membersByGroupId[row.id] || [])
+      .sort((a,b)=>a.sort_order-b.sort_order)
+      .map(member => ({
+        id: member.id,
+        nom: member.nom,
+        grade: member.grade,
+        equipe: row.has_equipe ? (member.equipe || DEFAULT_ROTATION_ORDER[0]) : null,
+      })),
+  }));
 }
-function writeLocalChatKey(serviceId, value) {
-  if (!serviceId || typeof window === "undefined") return;
-  try { window.localStorage.setItem(chatKeyStorageKey(serviceId), value); }
-  catch {}
-}
-function clearLocalChatKey(serviceId) {
-  if (!serviceId || typeof window === "undefined") return;
-  try { window.localStorage.removeItem(chatKeyStorageKey(serviceId)); }
-  catch {}
+
+function shiftCongesAfterMemberDelete(prev, groupId, memberIndex) {
+  const next = {};
+  Object.entries(prev).forEach(([key, value]) => {
+    const [gid, rawMemberIndex, rawDay] = key.split(":");
+    if (gid !== groupId) {
+      next[key] = value;
+      return;
+    }
+    const currentMemberIndex = Number(rawMemberIndex);
+    if (currentMemberIndex < memberIndex) {
+      next[key] = value;
+      return;
+    }
+    if (currentMemberIndex > memberIndex) {
+      next[ck(gid, currentMemberIndex - 1, Number(rawDay))] = value;
+    }
+  });
+  return next;
 }
 function isMissingRelationError(error) {
   const msg = `${error?.message || ""} ${error?.details || ""}`.toLowerCase();
@@ -474,14 +492,17 @@ export default function App() {
   const [tab,      setTab]      = useState("planning");
   const [year,     setYear]     = useState(now.getFullYear());
   const [month,    setMonth]    = useState(now.getMonth()+1);
-  const [groupes,  setGroupes]  = useState(GROUPES_INIT);
+  const [groupes,  setGroupes]  = useState([]);
   const [gi,       setGi]       = useState(0);
   const [conges,   setConges]   = useState({});
   const [autoMode, setAutoMode] = useState(true);
-  const [ordre,    setOrdre]    = useState(["A","B","C","D"]);
+  const [ordre,    setOrdre]    = useState(DEFAULT_ROTATION_ORDER);
   const [dragEq,   setDragEq]   = useState(null);
   const [saving,   setSaving]   = useState(false);
   const [saveMsg,  setSaveMsg]  = useState("");
+  const [serviceConfigBusy, setServiceConfigBusy] = useState(false);
+  const [serviceConfigMsg,  setServiceConfigMsg]  = useState("");
+  const [personnelSaving,   setPersonnelSaving]   = useState(false);
   const [histo,    setHisto]    = useState([]);
   const [histoBusy,setHistoBusy]= useState(false);
   const [msgs,     setMsgs]     = useState([{r:"a",t:"Bonjour ! 🏥 Connectez-vous pour commencer."}]);
@@ -498,7 +519,7 @@ export default function App() {
 
   const mn      = MOIS_FR[month-1];
   const days    = getDays(year,month);
-  const g       = groupes[gi];
+  const g       = groupes[gi] || null;
   const eqDebut = equipeDebut(year,month,ordre);
   const effectiveChatApiKey = chatApiKey.trim() || DEFAULT_CHAT_API_KEY.trim();
   const effectiveChatApiKeySource = chatApiKey.trim()
@@ -508,6 +529,105 @@ export default function App() {
   const chatStatusTone = chatReady
     ? { bg:"rgba(34,197,94,.12)", border:"rgba(34,197,94,.35)", color:"#86efac" }
     : { bg:"rgba(239,68,68,.10)", border:"rgba(239,68,68,.28)", color:"#fca5a5" };
+  const groupMetaById = Object.fromEntries(groupes.map(group => [group.id, { label: group.label, color: group.color }]));
+
+  function resetWorkspace(nextService = null) {
+    const current = new Date();
+    setService(nextService);
+    setLoggedIn(Boolean(nextService));
+    setTab("planning");
+    setYear(current.getFullYear());
+    setMonth(current.getMonth()+1);
+    setGroupes([]);
+    setGi(0);
+    setConges({});
+    setAutoMode(true);
+    setOrdre(DEFAULT_ROTATION_ORDER);
+    setDragEq(null);
+    setSaveMsg("");
+    setServiceConfigMsg("");
+    setHisto([]);
+    setChatIn("");
+    setChatBusy(false);
+    setChatApiKey("");
+    setChatApiKeyInput("");
+    setChatApiKeyBusy(false);
+    setChatApiKeyMsg("");
+    setChatApiKeySource(DEFAULT_CHAT_API_KEY.trim() ? "env" : "none");
+    setShowChatApiKey(false);
+    setMsgs([{r:"a",t:"Bonjour ! 🏥 Connectez-vous pour commencer."}]);
+  }
+
+  const loadServiceConfig = useCallback(async(serviceId, options = {})=>{
+    const { seedIfEmpty = true, silent = false } = options;
+    if(!serviceId){
+      setGroupes([]);
+      setGi(0);
+      if(!silent) setServiceConfigMsg("");
+      return [];
+    }
+
+    if(!silent){
+      setServiceConfigBusy(true);
+      setServiceConfigMsg("⏳ Chargement du personnel…");
+    }
+
+    try {
+      const db = getSupabaseClient();
+      let { data: groupRows, error: groupsError } = await db
+        .from("service_groups")
+        .select("id,code,label,subtitle,color,has_equipe,sort_order")
+        .eq("service_id", serviceId)
+        .order("sort_order", { ascending: true });
+      if (groupsError) throw groupsError;
+
+      if ((groupRows || []).length === 0 && seedIfEmpty) {
+        const { error: seedError } = await db.rpc("seed_service_defaults", { target_service_id: serviceId });
+        if (seedError) throw seedError;
+        const { data: seededGroups, error: reloadError } = await db
+          .from("service_groups")
+          .select("id,code,label,subtitle,color,has_equipe,sort_order")
+          .eq("service_id", serviceId)
+          .order("sort_order", { ascending: true });
+        if (reloadError) throw reloadError;
+        groupRows = seededGroups || [];
+      }
+
+      const groupIds = (groupRows || []).map(row => row.id);
+      let memberRows = [];
+      if (groupIds.length > 0) {
+        const { data, error } = await db
+          .from("service_members")
+          .select("id,group_id,nom,grade,equipe,sort_order")
+          .in("group_id", groupIds)
+          .order("sort_order", { ascending: true });
+        if (error) throw error;
+        memberRows = data || [];
+      }
+
+      const mappedGroups = mapServiceData(groupRows || [], memberRows);
+      setGroupes(mappedGroups);
+      setGi(prev => {
+        if (mappedGroups.length === 0) return 0;
+        return Math.min(prev, mappedGroups.length - 1);
+      });
+      if(!silent) setServiceConfigMsg(mappedGroups.length ? "" : "⚠️ Aucun groupe configuré dans Supabase.");
+      return mappedGroups;
+    } catch (error) {
+      setGroupes([]);
+      setGi(0);
+      if(!silent){
+        setServiceConfigMsg(
+          `❌ ${isMissingRelationError(error)
+            ? "Les tables service_groups/service_members ou la fonction seed_service_defaults manquent dans Supabase."
+            : dbError(error, "Chargement du personnel impossible.")}`
+        );
+      }
+      return [];
+    } finally {
+      if(!silent) setServiceConfigBusy(false);
+    }
+  },[]);
 
   // Auto-gardes
   useEffect(()=>{
@@ -523,6 +643,17 @@ export default function App() {
   },[year,month,ordre,autoMode]);
 
   useEffect(()=>{
+    if(!service?.id){
+      setGroupes([]);
+      setGi(0);
+      setServiceConfigBusy(false);
+      setServiceConfigMsg("");
+      return;
+    }
+    loadServiceConfig(service.id);
+  },[service?.id, loadServiceConfig]);
+
+  useEffect(()=>{
     let active = true;
     async function loadChatApiKey() {
       if(!service?.id){
@@ -535,14 +666,6 @@ export default function App() {
         return;
       }
 
-      const localKey = readLocalChatKey(service.id);
-      if(active){
-        setChatApiKey(localKey);
-        setChatApiKeyInput(localKey);
-        setChatApiKeySource(localKey ? "local" : (DEFAULT_CHAT_API_KEY.trim() ? "env" : "none"));
-        setChatApiKeyMsg("");
-      }
-
       try{
         const db = getSupabaseClient();
         const { data, error } = await db
@@ -553,16 +676,22 @@ export default function App() {
           .maybeSingle();
         if(error) throw error;
         const remoteKey = data?.api_key || "";
-        if(!active || !remoteKey) return;
-        writeLocalChatKey(service.id, remoteKey);
+        if(!active) return;
         setChatApiKey(remoteKey);
         setChatApiKeyInput(remoteKey);
-        setChatApiKeySource("supabase");
-      }catch{
-        if(active && localKey){
-          setChatApiKeySource("local");
-        } else if (active && DEFAULT_CHAT_API_KEY.trim()) {
+        setChatApiKeyMsg("");
+        if(remoteKey){
+          setChatApiKeySource("supabase");
+        } else if (DEFAULT_CHAT_API_KEY.trim()) {
           setChatApiKeySource("env");
+        } else {
+          setChatApiKeySource("none");
+        }
+      }catch{
+        if (active && DEFAULT_CHAT_API_KEY.trim()) {
+          setChatApiKeySource("env");
+        } else if (active) {
+          setChatApiKeySource("none");
         }
       }
     }
@@ -571,7 +700,7 @@ export default function App() {
   },[service?.id]);
 
   // ── LOGIN ──
-  function doLogin(svc) { setService(svc); setLoggedIn(true); setLoginMsg(""); }
+  function doLogin(svc) { resetWorkspace(svc); setLoginMsg(""); }
   async function joinService() {
     const code = inputCode.trim().toUpperCase();
     if (!code) { setLoginMsg("❌ Entrez un code."); return; }
@@ -631,21 +760,120 @@ export default function App() {
     setConges(prev=>{ const k=ck(gid,mi,jour),n={...prev}; if(!v||v===prev[k])delete n[k]; else n[k]=v.toUpperCase(); return n; });
   }
   function applyIA(updates){ setConges(prev=>{ const n={...prev}; updates.forEach(({gid,mi,jour,code})=>{ const k=ck(gid,mi,jour); if(!code)delete n[k]; else n[k]=code; }); return n; }); }
-  function addM(i){ setGroupes(p=>p.map((gg,x)=>x!==i?gg:{...gg,membres:[...gg.membres,{nom:"Nouveau",grade:"Grade",equipe:gg.hasEquipe?"A":null}]})); }
-  function delM(i,mi){ setGroupes(p=>p.map((gg,x)=>x!==i?gg:{...gg,membres:gg.membres.filter((_,j)=>j!==mi)})); }
-  function updM(i,mi,f,v){ setGroupes(p=>p.map((gg,x)=>x!==i?gg:{...gg,membres:gg.membres.map((m,j)=>j!==mi?m:{...m,[f]:v})})); }
+  function addM(i){
+    setServiceConfigMsg("");
+    setGroupes(p=>p.map((gg,x)=>x!==i?gg:{...gg,membres:[...gg.membres,{id:crypto.randomUUID(),nom:"Nouveau",grade:"Grade",equipe:gg.hasEquipe?DEFAULT_ROTATION_ORDER[0]:null}]}));
+  }
+  function delM(i,mi){
+    const groupId = groupes[i]?.id;
+    setServiceConfigMsg("");
+    setGroupes(p=>p.map((gg,x)=>x!==i?gg:{...gg,membres:gg.membres.filter((_,j)=>j!==mi)}));
+    if(groupId){
+      setConges(prev=>shiftCongesAfterMemberDelete(prev, groupId, mi));
+    }
+  }
+  function updM(i,mi,f,v){
+    setServiceConfigMsg("");
+    setGroupes(p=>p.map((gg,x)=>x!==i?gg:{...gg,membres:gg.membres.map((m,j)=>j!==mi?m:{...m,[f]:v})}));
+  }
   function dropEq(t){ if(!dragEq||dragEq===t)return; setOrdre(p=>{ const a=[...p],fi=a.indexOf(dragEq),ti=a.indexOf(t); a.splice(fi,1);a.splice(ti,0,dragEq);return a; }); setDragEq(null); }
+
+  async function savePersonnelConfig(){
+    if(!service?.id){ return; }
+    setPersonnelSaving(true);
+    setServiceConfigMsg("⏳ Sauvegarde du personnel…");
+
+    try {
+      const db = getSupabaseClient();
+      const updatedAt = new Date().toISOString();
+      const groupPayload = groupes.map((group, index) => {
+        const payload = {
+          service_id: service.id,
+          code: group.id,
+          label: group.label,
+          subtitle: group.subtitle,
+          color: group.color,
+          has_equipe: group.hasEquipe,
+          sort_order: index,
+          updated_at: updatedAt,
+        };
+        if (group.dbId) payload.id = group.dbId;
+        return payload;
+      });
+
+      const { data: savedGroups, error: groupError } = await db
+        .from("service_groups")
+        .upsert(groupPayload, { onConflict: "service_id,code" })
+        .select("id,code");
+      if (groupError) throw groupError;
+
+      const groupIdByCode = Object.fromEntries((savedGroups || []).map(row => [row.code, row.id]));
+      const persistedGroupIds = Object.values(groupIdByCode);
+      let existingMembers = [];
+
+      if (persistedGroupIds.length > 0) {
+        const { data, error } = await db
+          .from("service_members")
+          .select("id,group_id")
+          .in("group_id", persistedGroupIds);
+        if (error) throw error;
+        existingMembers = data || [];
+      }
+
+      const memberPayload = groupes.flatMap(group => {
+        const groupId = groupIdByCode[group.id];
+        if (!groupId) return [];
+        return group.membres.map((member, index) => ({
+          id: member.id || crypto.randomUUID(),
+          group_id: groupId,
+          nom: member.nom,
+          grade: member.grade,
+          equipe: group.hasEquipe ? (member.equipe || DEFAULT_ROTATION_ORDER[0]) : null,
+          sort_order: index,
+          updated_at: updatedAt,
+        }));
+      });
+
+      const persistedMemberIds = new Set(memberPayload.map(member => member.id));
+      const memberIdsToDelete = existingMembers
+        .filter(member => !persistedMemberIds.has(member.id))
+        .map(member => member.id);
+
+      if (memberIdsToDelete.length > 0) {
+        const { error: deleteError } = await db
+          .from("service_members")
+          .delete()
+          .in("id", memberIdsToDelete);
+        if (deleteError) throw deleteError;
+      }
+
+      if (memberPayload.length > 0) {
+        const { error: memberError } = await db
+          .from("service_members")
+          .upsert(memberPayload);
+        if (memberError) throw memberError;
+      }
+
+      await loadServiceConfig(service.id, { seedIfEmpty: false, silent: true });
+      setServiceConfigMsg(`✅ Personnel synchronisé dans Supabase (${memberPayload.length} membre(s)).`);
+    } catch (error) {
+      setServiceConfigMsg(`❌ ${dbError(error, "Sauvegarde du personnel impossible.")}`);
+    } finally {
+      setPersonnelSaving(false);
+    }
+  }
 
   // Sauvegarde
   async function save(){
     if(!service){return;}
+    if(groupes.length===0){ setSaveMsg("❌ Aucun groupe chargé depuis Supabase."); return; }
     setSaving(true); setSaveMsg("⏳ Sauvegarde…");
     const rows=[];
     groupes.forEach(gg=>gg.membres.forEach((m,mi)=>{ for(let j=1;j<=days;j++){ const c=conges[ck(gg.id,mi,j)]; if(c)rows.push({gid:gg.id,mi,nom:m.nom,eq:m.equipe,j,c}); } }));
     try {
       const db = getSupabaseClient();
       const updatedAt = new Date().toISOString();
-      const planningPayload = GROUPE_IDS.map(groupeId => ({
+      const planningPayload = groupes.map(({ id: groupeId }) => ({
         service_id: service.id,
         annee: year,
         mois: month,
@@ -835,13 +1063,11 @@ export default function App() {
     const nextKey = chatApiKeyInput.trim();
     if(!nextKey){ setChatApiKeyMsg("❌ Entrez une clé API Gemini."); return; }
     if(!service?.id){ setChatApiKeyMsg("❌ Aucun service actif."); return; }
+    const previousKey = chatApiKey;
+    const previousSource = chatApiKeySource;
 
     setChatApiKeyBusy(true);
     setChatApiKeyMsg("⏳ Sauvegarde de la clé…");
-    writeLocalChatKey(service.id, nextKey);
-    setChatApiKey(nextKey);
-    setChatApiKeySource("local");
-
     try{
       const db = getSupabaseClient();
       const { error } = await db
@@ -854,13 +1080,17 @@ export default function App() {
           updated_at: new Date().toISOString(),
         }, { onConflict: "service_id,provider" });
       if(error) throw error;
+      setChatApiKey(nextKey);
+      setChatApiKeyInput(nextKey);
       setChatApiKeySource("supabase");
-      setChatApiKeyMsg("✅ Clé API sauvée localement et synchronisée dans Supabase.");
+      setChatApiKeyMsg("✅ Clé API sauvée dans Supabase.");
     }catch(error){
+      setChatApiKey(previousKey);
+      setChatApiKeySource(previousSource);
       if(isMissingRelationError(error)){
-        setChatApiKeyMsg("⚠️ Clé API sauvée localement. La table service_ai_settings manque encore dans Supabase.");
+        setChatApiKeyMsg("⚠️ La table service_ai_settings manque encore dans Supabase.");
       }else{
-        setChatApiKeyMsg(`⚠️ Clé API sauvée localement. Sync Supabase indisponible: ${dbError(error, "erreur inconnue")}`);
+        setChatApiKeyMsg(`⚠️ Sauvegarde Supabase indisponible: ${dbError(error, "erreur inconnue")}`);
       }
     }finally{
       setChatApiKeyBusy(false);
@@ -874,13 +1104,12 @@ export default function App() {
         : "⚠️ Aucune clé utilisateur enregistrée.");
       return;
     }
+    const previousKey = chatApiKey;
+    const previousInput = chatApiKeyInput;
+    const previousSource = chatApiKeySource;
 
     setChatApiKeyBusy(true);
     setChatApiKeyMsg("⏳ Suppression de la clé…");
-    clearLocalChatKey(service.id);
-    setChatApiKey("");
-    setChatApiKeyInput("");
-    setChatApiKeySource("none");
     setShowChatApiKey(false);
 
     try{
@@ -891,12 +1120,18 @@ export default function App() {
         .eq("service_id", service.id)
         .eq("provider", CHAT_PROVIDER);
       if(error) throw error;
-      setChatApiKeyMsg("🗑️ Clé API supprimée localement et dans Supabase.");
+      setChatApiKey("");
+      setChatApiKeyInput("");
+      setChatApiKeySource(DEFAULT_CHAT_API_KEY.trim() ? "env" : "none");
+      setChatApiKeyMsg("🗑️ Clé API supprimée de Supabase.");
     }catch(error){
+      setChatApiKey(previousKey);
+      setChatApiKeyInput(previousInput);
+      setChatApiKeySource(previousSource);
       if(isMissingRelationError(error)){
-        setChatApiKeyMsg("🗑️ Clé API supprimée localement.");
+        setChatApiKeyMsg("⚠️ La table service_ai_settings manque encore dans Supabase.");
       }else{
-        setChatApiKeyMsg(`⚠️ Clé locale supprimée. Suppression Supabase impossible: ${dbError(error, "erreur inconnue")}`);
+        setChatApiKeyMsg(`⚠️ Suppression Supabase impossible: ${dbError(error, "erreur inconnue")}`);
       }
     }finally{
       setChatApiKeyBusy(false);
@@ -929,7 +1164,7 @@ async function sendChat(){
   const systemPrompt = `Agent planning hospitalier — ${service?.etablissement}.
 CONTEXTE:${JSON.stringify(ctx)}
 CODES:G=Garde RE=Récup C=Congé CM=Maladie M=Maternité N=Normal F=Férié
-IDs:medecins|administratifs|paramedical|hygiene
+IDs:${groupes.map(group => group.id).join("|")}
 Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":5,"code":"C"}],"msg":"..."}
 Sinon→JSON:{"action":"msg","msg":"..."}`;
 
@@ -1053,12 +1288,12 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
           🔄 {mn.slice(0,3)}. → Éq.<b style={{marginLeft:4}}>{eqDebut}</b>
         </div>
         <div style={{marginLeft:"auto",display:"flex",gap:6,alignItems:"center",position:"relative"}}>
-          <button onClick={save} disabled={saving} style={{...BTN,background:"linear-gradient(135deg,#059669,#0891b2)",fontSize:11}}>{saving?"⏳…":"💾 Sauver"}</button>
+          <button onClick={save} disabled={saving||serviceConfigBusy||groupes.length===0} style={{...BTN,background:"linear-gradient(135deg,#059669,#0891b2)",fontSize:11,opacity:(saving||serviceConfigBusy||groupes.length===0)?0.7:1}}>{saving?"⏳…":"💾 Sauver"}</button>
 
           {/* ── Menu PDF ── */}
           <div style={{position:"relative"}}>
             <button
-              onClick={()=>setPdfMenu(p=>!p)}
+              onClick={()=>groupes.length>0&&setPdfMenu(p=>!p)}
               style={{...BTN,background:"linear-gradient(135deg,#7c3aed,#1d4ed8)",fontSize:11}}
             >
               📄 PDF ▾
@@ -1090,7 +1325,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
             )}
           </div>
 
-          <button onClick={()=>{setLoggedIn(false);setService(null);}} style={{...BTN,background:"rgba(255,255,255,.05)",color:"#64748b",fontSize:11}}>⬅</button>
+          <button onClick={()=>resetWorkspace(null)} style={{...BTN,background:"rgba(255,255,255,.05)",color:"#64748b",fontSize:11}}>⬅</button>
         </div>
       </div>
       {saveMsg&&<div style={{padding:"5px 18px",fontSize:11,background:saveMsg.startsWith("✅")?"rgba(34,197,94,.07)":"rgba(239,68,68,.07)",color:saveMsg.startsWith("✅")?"#4ade80":"#f87171"}}>{saveMsg}</div>}
@@ -1118,7 +1353,8 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
 
         {tab==="planning"&&(
           <div style={{flex:1,padding:16,overflowY:"auto"}}>
-            <div style={{background:"rgba(255,255,255,.015)",border:`1px solid ${g.color}22`,borderRadius:10,padding:12}}>
+            {!g&&<div style={{background:"rgba(255,255,255,.015)",border:"1px solid rgba(255,255,255,.08)",borderRadius:10,padding:18,color:"#94a3b8",fontSize:12,textAlign:"center"}}>{serviceConfigBusy ? "⏳ Chargement du personnel depuis Supabase…" : (serviceConfigMsg || "Aucun groupe disponible.")}</div>}
+            {g&&<div style={{background:"rgba(255,255,255,.015)",border:`1px solid ${g.color}22`,borderRadius:10,padding:12}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
                 <b style={{color:g.color,fontSize:13}}>{g.subtitle} — {mn.toUpperCase()} {year}</b>
                 {g.id==="paramedical"&&<label style={{fontSize:10,color:"#64748b",display:"flex",gap:5,cursor:"pointer",alignItems:"center"}}>
@@ -1137,7 +1373,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
                   </tr></thead>
                   <tbody>
                     {g.membres.map((m,mi)=>(
-                      <tr key={mi} style={{borderBottom:"1px solid rgba(255,255,255,.03)"}}>
+                      <tr key={m.id || mi} style={{borderBottom:"1px solid rgba(255,255,255,.03)"}}>
                         <td style={{...PTD,padding:"2px 6px",fontWeight:600,color:"#e2e8f0"}}>{m.nom}</td>
                         <td style={{...PTD,padding:"2px 3px",color:"#64748b",fontSize:9}}>{m.grade}</td>
                         {g.hasEquipe&&<td style={{...PTD,textAlign:"center",color:g.color,fontWeight:700,fontSize:10}}>{m.equipe}</td>}
@@ -1155,7 +1391,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
               <div style={{marginTop:8,display:"flex",gap:8,flexWrap:"wrap",fontSize:9}}>
                 {CODES.map(c=><span key={c.code}><b style={{color:c.color}}>{c.code}</b><span style={{color:"#475569"}}> {c.label}</span></span>)}
               </div>
-            </div>
+            </div>}
           </div>
         )}
 
@@ -1179,7 +1415,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
                 </div>
               ))}
             </div>
-            <button onClick={()=>setOrdre(["A","B","C","D"])} style={{...BTN,background:"rgba(255,255,255,.05)",color:"#64748b",marginBottom:20}}>↺ Reset A→B→C→D</button>
+            <button onClick={()=>setOrdre(DEFAULT_ROTATION_ORDER)} style={{...BTN,background:"rgba(255,255,255,.05)",color:"#64748b",marginBottom:20}}>↺ Reset A→B→C→D</button>
             <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:8}}>
               {Array.from({length:12},(_,i)=>{ const m2=(month+i-1)%12+1,y2=year+Math.floor((month+i-1)/12),eq=equipeDebut(y2,m2,ordre),cur=m2===month&&y2===year;
                 return <div key={i} style={{background:cur?"rgba(239,68,68,.09)":"rgba(255,255,255,.02)",border:`1px solid ${cur?"rgba(239,68,68,.3)":"rgba(255,255,255,.06)"}`,borderRadius:8,padding:"9px 12px"}}>
@@ -1195,15 +1431,23 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
 
         {tab==="config"&&(
           <div style={{flex:1,padding:18,overflowY:"auto"}}>
-            <div style={{background:"rgba(255,255,255,.02)",border:`1px solid ${g.color}20`,borderRadius:9,padding:16}}>
-              <div style={{fontSize:12,fontWeight:700,color:g.color,marginBottom:12,textTransform:"uppercase"}}>{g.label}</div>
+            {!g&&<div style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.08)",borderRadius:9,padding:18,color:"#94a3b8",fontSize:12,textAlign:"center"}}>{serviceConfigBusy ? "⏳ Chargement du personnel depuis Supabase…" : (serviceConfigMsg || "Aucun groupe disponible.")}</div>}
+            {g&&<div style={{background:"rgba(255,255,255,.02)",border:`1px solid ${g.color}20`,borderRadius:9,padding:16}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:12}}>
+                <div style={{fontSize:12,fontWeight:700,color:g.color,textTransform:"uppercase"}}>{g.label}</div>
+                <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                  <button onClick={()=>loadServiceConfig(service.id, { seedIfEmpty: false })} disabled={serviceConfigBusy||personnelSaving} style={{...BTN,background:"rgba(255,255,255,.05)",color:"#cbd5e1",fontSize:11,opacity:(serviceConfigBusy||personnelSaving)?0.7:1}}>↻ Recharger</button>
+                  <button onClick={savePersonnelConfig} disabled={serviceConfigBusy||personnelSaving} style={{...BTN,background:`linear-gradient(135deg,${g.color},#0891b2)`,fontSize:11,opacity:(serviceConfigBusy||personnelSaving)?0.7:1}}>{personnelSaving?"⏳…":"Sauver le personnel"}</button>
+                </div>
+              </div>
+              {serviceConfigMsg&&<div style={{marginBottom:12,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.06)",fontSize:11,color:"#cbd5e1"}}>{serviceConfigMsg}</div>}
               <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
                 <thead><tr style={{background:"rgba(255,255,255,.04)"}}>
                   <th style={TH}>N°</th><th style={TH}>Nom</th><th style={TH}>Grade</th>{g.hasEquipe&&<th style={{...TH,width:65}}>Éq.</th>}<th style={{...TH,width:36}}></th>
                 </tr></thead>
                 <tbody>
                   {g.membres.map((m,mi)=>(
-                    <tr key={mi} style={{borderBottom:"1px solid rgba(255,255,255,.04)"}}>
+                    <tr key={m.id || mi} style={{borderBottom:"1px solid rgba(255,255,255,.04)"}}>
                       <td style={{...TD,color:"#475569",textAlign:"center",width:32}}>{mi+1}</td>
                       <td style={TD}><input value={m.nom} onChange={e=>updM(gi,mi,"nom",e.target.value)} style={{...INP,width:"100%"}}/></td>
                       <td style={TD}><input value={m.grade} onChange={e=>updM(gi,mi,"grade",e.target.value)} style={{...INP,width:"100%"}}/></td>
@@ -1213,8 +1457,8 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
                   ))}
                 </tbody>
               </table>
-              <button onClick={()=>addM(gi)} style={{marginTop:10,...BTN,background:"transparent",border:`1px dashed ${g.color}44`,color:g.color,fontSize:11}}>+ Ajouter</button>
-            </div>
+              <button onClick={()=>addM(gi)} disabled={serviceConfigBusy||personnelSaving} style={{marginTop:10,...BTN,background:"transparent",border:`1px dashed ${g.color}44`,color:g.color,fontSize:11,opacity:(serviceConfigBusy||personnelSaving)?0.7:1}}>+ Ajouter</button>
+            </div>}
           </div>
         )}
 
@@ -1226,7 +1470,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
             </div>
             {histoBusy?<div style={{color:"#475569",textAlign:"center",padding:20}}>⏳ Chargement…</div>
             :histo.length===0?<div style={{color:"#475569",textAlign:"center",padding:32}}>Aucun planning. Sauvegardez-en un d'abord.</div>
-            :<HistoList histo={histo} onLoad={loadPlan} onDelete={delPlan}/>}
+            :<HistoList histo={histo} onLoad={loadPlan} onDelete={delPlan} groupMetaById={groupMetaById}/>}
           </div>
         )}
 
@@ -1238,7 +1482,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
                   <div style={{fontSize:12,fontWeight:700,color:"#93c5fd"}}>Clé API Gemini</div>
                   <div style={{fontSize:10,color:"#475569",marginTop:2}}>
                     {chatReady ? `Configurée · ${chatKeyPreview(effectiveChatApiKey)}` : "Aucune clé configurée"}
-                    {effectiveChatApiKeySource==="supabase" ? " · source Supabase" : effectiveChatApiKeySource==="local" ? " · source locale" : effectiveChatApiKeySource==="env" ? " · source .env" : ""}
+                    {effectiveChatApiKeySource==="supabase" ? " · source Supabase" : effectiveChatApiKeySource==="env" ? " · source .env" : ""}
                   </div>
                 </div>
                 <div style={{padding:"5px 10px",borderRadius:999,border:`1px solid ${chatStatusTone.border}`,background:chatStatusTone.bg,color:chatStatusTone.color,fontSize:10,fontWeight:700}}>
@@ -1289,7 +1533,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
               </div>
 
               <div style={{fontSize:10,color:"#475569",marginTop:8}}>
-                Le bouton Sauver persiste la clé dans `localStorage`, puis tente une synchronisation Supabase si la table dédiée existe. Si aucune clé n'est enregistrée ici, l'app peut utiliser `REACT_APP_GEMINI_API_KEY`.
+                Le bouton Sauver persiste la clé dans Supabase si la table dédiée existe. Si aucune clé n'est enregistrée ici, l'app peut utiliser `REACT_APP_GEMINI_API_KEY`.
               </div>
               {chatApiKeyMsg&&<div style={{marginTop:10,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.06)",fontSize:11,color:"#cbd5e1"}}>{chatApiKeyMsg}</div>}
             </div>
@@ -1329,8 +1573,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
   );
 }
 
-function HistoList({ histo, onLoad, onDelete }) {
-  const GROUPES_INIT_REF = [{id:"medecins",label:"👨‍⚕️ Médecins",color:"#3b82f6"},{id:"administratifs",label:"🗂️ Administration",color:"#8b5cf6"},{id:"paramedical",label:"🏥 Paramédical",color:"#10b981"},{id:"hygiene",label:"🧹 Hygiène",color:"#f59e0b"}];
+function HistoList({ histo, onLoad, onDelete, groupMetaById }) {
   const grouped={};
   histo.forEach(r=>{ const k=`${r.annee}-${String(r.mois).padStart(2,"0")}`; if(!grouped[k])grouped[k]={annee:r.annee,mois:r.mois,rows:[]}; grouped[k].rows.push(r); });
   return <div style={{display:"flex",flexDirection:"column",gap:8}}>
@@ -1340,7 +1583,7 @@ function HistoList({ histo, onLoad, onDelete }) {
         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:6}}>
           <b style={{fontSize:13,color:"#93c5fd"}}>📅 {MOIS_FR[mois-1].charAt(0).toUpperCase()+MOIS_FR[mois-1].slice(1)} {annee}</b>
           <div style={{display:"flex",gap:4,flex:1,flexWrap:"wrap"}}>
-            {rows.map(r=>{ const gg=GROUPES_INIT_REF.find(g=>g.id===r.groupe_id); return <span key={r.id} style={{fontSize:9,padding:"1px 6px",borderRadius:3,background:`${gg?.color||"#64748b"}15`,color:gg?.color||"#64748b"}}>{gg?.label||r.groupe_id}</span>; })}
+            {rows.map(r=>{ const gg=groupMetaById?.[r.groupe_id]; return <span key={r.id} style={{fontSize:9,padding:"1px 6px",borderRadius:3,background:`${gg?.color||"#64748b"}15`,color:gg?.color||"#64748b"}}>{gg?.label||r.groupe_id}</span>; })}
           </div>
           <button onClick={()=>onLoad(annee,mois)} style={{...BTN,fontSize:10,padding:"3px 10px",background:"rgba(59,130,246,.15)",color:"#93c5fd"}}>📂</button>
           <button onClick={()=>onDelete(annee,mois)} style={{...BTN,fontSize:10,padding:"3px 9px",background:"rgba(239,68,68,.1)",color:"#f87171"}}>🗑️</button>
