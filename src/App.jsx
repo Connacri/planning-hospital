@@ -868,12 +868,14 @@ export default function App() {
   }
 
   // Sauvegarde
-  async function save(){
-    if(!service){return;}
-    if(groupes.length===0){ setSaveMsg("❌ Aucun groupe chargé depuis Supabase."); return; }
-    setSaving(true); setSaveMsg("⏳ Sauvegarde…");
-    const rows=[];
-    groupes.forEach(gg=>gg.membres.forEach((m,mi)=>{ for(let j=1;j<=days;j++){ const c=conges[ck(gg.id,mi,j)]; if(c)rows.push({gid:gg.id,mi,nom:m.nom,eq:m.equipe,j,c}); } }));
+  // congesOverride : passé par l'IA pour éviter le décalage async du state React
+    async function save(congesOverride = null, silent = false){
+      const effectiveConges = congesOverride ?? conges;
+      if(!service){return;}
+      if(groupes.length===0){ setSaveMsg("❌ Aucun groupe chargé depuis Supabase."); return; }
+      if(!silent) { setSaving(true); setSaveMsg("⏳ Sauvegarde…"); }
+      const rows=[];
+      groupes.forEach(gg=>gg.membres.forEach((m,mi)=>{ for(let j=1;j<=days;j++){ const c=effectiveConges[ck(gg.id,mi,j)]; if(c)rows.push({gid:gg.id,mi,nom:m.nom,eq:m.equipe,j,c}); } }));
     try {
       const db = getSupabaseClient();
       const updatedAt = new Date().toISOString();
@@ -935,11 +937,14 @@ export default function App() {
         }, { onConflict: "service_id,annee,mois" });
       if (rotationError) throw rotationError;
 
-      setSaveMsg(`✅ ${rows.length} codes sauvegardés`);
+      // En fin de try :
+           if(!silent) setSaveMsg(`✅ ${rows.length} codes sauvegardés`);
     } catch (error) {
-      setSaveMsg(`❌ ${dbError(error, "Erreur sauvegarde")}`);
+         // En fin de catch :
+           if(!silent) setSaveMsg(`❌ ${dbError(error, "Erreur sauvegarde")}`);
     } finally {
-      setSaving(false);
+         // En finally :
+            if(!silent) setSaving(false);
     }
   }
 
@@ -1172,20 +1177,41 @@ IDs:${groupes.map(group => group.id).join("|")}
 Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":5,"code":"C"}],"msg":"..."}
 Sinon→JSON:{"action":"msg","msg":"..."}`;
 
-  try {
+try {
       const raw = await generateWithGroq({
-      apiKey: effectiveChatApiKey,
-      systemPrompt,
-      userPrompt: txt,
-    });
-    let p;
-    try { p = JSON.parse(raw.replace(/```json|```/g,"").trim()); }
-    catch { p = { action:"msg", msg:raw }; }
-    if (p.action==="update" && p.updates) { applyIA(p.updates); addA("✅ "+p.msg); }
-    else addA(p.msg || raw);
-  } catch(e) {
-    addA("⚠️ Erreur: "+e.message);
-  }
+        apiKey: effectiveChatApiKey,
+        systemPrompt,
+        userPrompt: txt,
+      });
+      let p;
+      try { p = JSON.parse(raw.replace(/```json|```/g,"").trim()); }
+      catch { p = { action:"msg", msg:raw }; }
+
+      if (p.action === "update" && p.updates) {
+        // 1. Calculer les nouveaux congés de façon SYNCHRONE avant tout setState
+        const newConges = { ...conges };
+        p.updates.forEach(({ gid, mi, jour, code }) => {
+          const k = ck(gid, mi, jour);
+          if (!code) delete newConges[k];
+          else newConges[k] = code.toUpperCase();
+        });
+
+        // 2. Mettre à jour le state React
+        setConges(newConges);
+
+        // 3. Persister immédiatement en Supabase avec les nouvelles valeurs
+        addA("✅ " + p.msg + "\n⏳ Synchronisation Supabase…");
+
+        await save(newConges, true);   // ← pas de feedback dans la barre du haut
+        addA("💾 Planning mis à jour en base.");
+      } else {
+        addA(p.msg || raw);
+      }
+
+    } catch(e) {
+      addA("⚠️ Erreur: " + e.message);
+    }
+
 
   setChatBusy(false);
   setTimeout(()=>chatEnd.current?.scrollIntoView({behavior:"smooth"}),100);
