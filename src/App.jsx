@@ -467,6 +467,12 @@ export default function App() {
   const [ltBusy, setLtBusy] = useState(false);
   const [ltForm, setLtForm] = useState({ code: "", label: "", color: "#3b82f6" });
 
+  const [serviceHolidays, setServiceHolidays] = useState([]);
+  const [hBusy, setHBusy] = useState(false);
+  const [hLabel, setHLabel] = useState("");
+  const [hMonth, setHMonth] = useState(1);
+  const [hDay, setHDay] = useState(1);
+
   const loadLeaveTypes = useCallback(async (serviceId) => {
     if (!serviceId) return;
     setLtBusy(true);
@@ -486,6 +492,19 @@ export default function App() {
       }
     } catch (e) { console.error("Erreur types congés:", e); }
     finally { setLtBusy(false); }
+  }, []);
+
+  const loadHolidays = useCallback(async (serviceId) => {
+    if (!serviceId) return;
+    setHBusy(true);
+    try {
+      const db = getSupabaseClient();
+      const { data, error } = await db.from("service_holidays")
+        .select("*").eq("service_id", serviceId).order("mois, jour");
+      if (error) throw error;
+      setServiceHolidays(data || []);
+    } catch (e) { console.error("Erreur fériés:", e); }
+    finally { setHBusy(false); }
   }, []);
 
   async function addLeaveType() {
@@ -548,6 +567,12 @@ export default function App() {
       setServiceHolidays(prev => prev.filter(h => h.id !== id));
     } catch (e) { alert(e.message); } finally { setHBusy(false); }
   }
+
+  const isFerie = useCallback((m, d) => {
+    const fixed = FERIES_ALGERIE.some(f => f.m === m && f.j === d);
+    const custom = serviceHolidays.some(h => h.mois === m && h.jour === d);
+    return fixed || custom;
+  }, [serviceHolidays]);
 
   function applyHolidaysToPlanning() {
     const nc = { ...conges };
@@ -614,18 +639,26 @@ export default function App() {
     }
   },[]);
 
-  // ── Auto-gardes paramédical ──
+  // ── Auto-gardes pour tous les groupes avec rotation ──
   useEffect(()=>{
     if(!autoMode) return;
-    const pi=groupes.findIndex(x=>x.id==="paramedical"); if(pi<0) return;
-    const r=calcAutoGardes(year,month,groupes[pi].membres,ordre,computedEqDebut);
     setConges(prev=>{
       const n={...prev};
-      Object.keys(n).filter(k=>k.startsWith("paramedical:")&&n[k]==="G").forEach(k=>delete n[k]);
-      Object.entries(r).forEach(([key,code])=>{ const [mi,j]=key.split(":").map(Number); const fk=ck("paramedical",mi,j); if(!n[fk])n[fk]=code; });
+      groupes.forEach(gg=>{
+        if(!gg.hasEquipe) return;
+        // On nettoie les gardes auto "G" existantes pour ce groupe
+        Object.keys(n).filter(k=>k.startsWith(`${gg.id}:`)&&n[k]==="G").forEach(k=>delete n[k]);
+        // On recalcule
+        const r=calcAutoGardes(year,month,gg.membres,ordre,computedEqDebut);
+        Object.entries(r).forEach(([key,code])=>{
+          const [mi,j]=key.split(":").map(Number);
+          const fk=ck(gg.id,mi,j);
+          if(!n[fk]) n[fk]=code;
+        });
+      });
       return n;
     });
-  },[year,month,ordre,autoMode,computedEqDebut]);
+  },[year,month,ordre,autoMode,computedEqDebut,groupes]);
 
   useEffect(()=>{
     if(!service?.id){ setGroupes([]); setGi(0); setServiceConfigBusy(false); setServiceConfigMsg(""); return; }
@@ -711,7 +744,7 @@ export default function App() {
         for (let d = 1; d <= totalDays; d++) {
           const dw    = getDow(year, month, d);
           const we    = isWE(dw);
-          const ferie = isFerieAlg(month, d);
+          const ferie = isFerie(month, d);
           const k     = ck(gg.id, mi, d);
 
           if (gg.id === "paramedical") {
@@ -733,7 +766,7 @@ export default function App() {
       paraGroupe.membres.forEach((m, mi) => {
         for (let d = 1; d <= totalDays; d++) {
           const k     = ck("paramedical", mi, d);
-          const ferie = isFerieAlg(month, d);
+          const ferie = isFerie(month, d);
           newConges[k] = ferie ? "F" : "RE";
         }
       });
@@ -1136,7 +1169,7 @@ FORMAT réponse informative :
   // ══════════════════════════════════════════════
   //  RENDER APP
   // ══════════════════════════════════════════════
-  const TABS=[{id:"planning",icon:"📋",lbl:"Planning"},{id:"gardes",icon:"🔄",lbl:"Rotation"},{id:"config",icon:"⚙️",lbl:"Personnel"},{id:"types_conges",icon:"🏖️",lbl:"Congés"},{id:"historique",icon:"🕓",lbl:"Historique"},{id:"chat",icon:"💬",lbl:"IA"}];
+  const TABS=[{id:"planning",icon:"📋",lbl:"Planning"},{id:"gardes",icon:"🔄",lbl:"Rotation"},{id:"config",icon:"⚙️",lbl:"Personnel"},{id:"types_conges",icon:"🏖️",lbl:"Congés"},{id:"feries",icon:"📅",lbl:"Fériés"},{id:"historique",icon:"🕓",lbl:"Historique"},{id:"chat",icon:"💬",lbl:"IA"}];
   return (
     <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",background:"#070d1a",color:"#e2e8f0",fontFamily:"system-ui,sans-serif"}}>
 
@@ -1213,7 +1246,7 @@ FORMAT réponse informative :
             {g&&<div style={{background:"rgba(255,255,255,.015)",border:`1px solid ${g.color}22`,borderRadius:10,padding:12}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
                 <b style={{color:g.color,fontSize:13}}>{g.subtitle} — {mn.toUpperCase()} {year}</b>
-                {g.id==="paramedical"&&<label style={{fontSize:10,color:"#64748b",display:"flex",gap:5,cursor:"pointer",alignItems:"center"}}>
+                {g.hasEquipe&&<label style={{fontSize:10,color:"#64748b",display:"flex",gap:5,cursor:"pointer",alignItems:"center"}}>
                   <input type="checkbox" checked={autoMode} onChange={e=>setAutoMode(e.target.checked)} style={{accentColor:"#ef4444"}}/>Gardes auto
                 </label>}
               </div>
@@ -1224,7 +1257,7 @@ FORMAT réponse informative :
                     <th style={{...PTH,width:84,textAlign:"left",padding:"3px 3px"}}>Grade</th>
                     {g.hasEquipe&&<th style={{...PTH,width:22,color:g.color}}>Éq</th>}
                     {Array.from({length:days},(_,i)=>{
-                      const d=i+1,dw=getDow(year,month,d),we=isWE(dw),ferie=isFerieAlg(month,d);
+                      const d=i+1,dw=getDow(year,month,d),we=isWE(dw),ferie=isFerie(month,d);
                       return <th key={d} style={{...PTH,width:21,padding:"2px 0",background:ferie?"#001a1a":we?"#1a0800":"#0c1625",color:ferie?"#06b6d4":we?"#f97316":"#475569",fontSize:8}}>{d}<br/><span style={{fontSize:7}}>{JOURS_FR[dw].slice(0,2)}</span></th>;
                     })}
                   </tr></thead>
@@ -1235,7 +1268,7 @@ FORMAT réponse informative :
                         <td style={{...PTD,padding:"2px 3px",color:"#64748b",fontSize:9}}>{m.grade}</td>
                         {g.hasEquipe&&<td style={{...PTD,textAlign:"center",color:g.color,fontWeight:700,fontSize:10}}>{m.equipe}</td>}
                         {Array.from({length:days},(_,i)=>{
-                          const d=i+1,dw=getDow(year,month,d),we=isWE(dw),code=conges[ck(g.id,mi,d)]||"",ci=leaveTypes.find(c=>c.code===code),isAuto=autoMode&&g.id==="paramedical"&&code==="G",ferie=isFerieAlg(month,d);
+                          const d=i+1,dw=getDow(year,month,d),we=isWE(dw),code=conges[ck(g.id,mi,d)]||"",ci=leaveTypes.find(c=>c.code===code),isAuto=autoMode&&g.hasEquipe&&code==="G",ferie=isFerie(month,d);
                           return <td key={d} style={{...PTD,width:21,padding:0,background:ferie?"rgba(0,40,40,.5)":we?"rgba(40,12,0,.5)":isAuto?"rgba(239,68,68,.05)":"transparent"}}>
                             <input value={code} maxLength={3} onChange={e=>setCode(g.id,mi,d,e.target.value)}
                               style={{width:21,height:20,border:"none",background:"transparent",textAlign:"center",fontSize:9,fontWeight:700,outline:"none",color:ci?ci.color:ferie?"#06b6d4":we?"#2d1a0a":"#334155",fontStyle:isAuto?"italic":"normal",cursor:"text"}}/>
@@ -1251,6 +1284,66 @@ FORMAT réponse informative :
                 <span style={{color:"#475569"}}>· <b style={{color:"#06b6d4"}}>Cyan</b> = Jour Férié · <b style={{color:"#f97316"}}>Orange</b> = Weekend (Ven/Sam)</span>
               </div>
             </div>}
+          </div>
+        )}
+
+        {tab==="feries"&&(
+          <div style={{flex:1,padding:20,overflowY:"auto"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+              <b style={{fontSize:16,color:"#06b6d4"}}>📅 Jours Fériés Personnalisés</b>
+              <button onClick={applyHolidaysToPlanning} style={{...BTN,background:"rgba(6,182,212,.15)",color:"#06b6d4"}}>⚡ Appliquer au planning actuel</button>
+            </div>
+
+            <div style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.08)",borderRadius:12,padding:16,marginBottom:20}}>
+              <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}}>
+                <div style={{width:60}}>
+                  <div style={{fontSize:11,color:"#64748b",marginBottom:5}}>Jour</div>
+                  <input type="number" min={1} max={31} value={hDay} onChange={e=>setHDay(+e.target.value)} style={INP}/>
+                </div>
+                <div style={{width:140}}>
+                  <div style={{fontSize:11,color:"#64748b",marginBottom:5}}>Mois</div>
+                  <select value={hMonth} onChange={e=>setHMonth(+e.target.value)} style={SEL}>
+                    {MOIS_FR.map((m,i)=><option key={i} value={i+1}>{m}</option>)}
+                  </select>
+                </div>
+                <div style={{flex:1,minWidth:180}}>
+                  <div style={{fontSize:11,color:"#64748b",marginBottom:5}}>Label (ex: Fête locale)</div>
+                  <input value={hLabel} onChange={e=>setHLabel(e.target.value)} placeholder="Nom du jour férié" style={INP}/>
+                </div>
+                <button onClick={addHoliday} disabled={hBusy} style={{...BTN,background:"linear-gradient(135deg,#0891b2,#06b6d4)",height:31}}>+ Ajouter</button>
+              </div>
+            </div>
+
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:12}}>
+              {/* Fériés Fixes */}
+              {FERIES_ALGERIE.map((f,i)=>(
+                <div key={`fixed-${i}`} style={{background:"rgba(255,255,255,.01)",border:"1px solid rgba(255,255,255,.04)",borderRadius:10,padding:12,display:"flex",alignItems:"center",gap:12,opacity:0.6}}>
+                  <div style={{width:45,textAlign:"center"}}>
+                    <div style={{fontSize:16,fontWeight:800,color:"#475569"}}>{f.j}</div>
+                    <div style={{fontSize:9,color:"#475569",textTransform:"uppercase"}}>{MOIS_FR[f.m-1].slice(0,3)}</div>
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:13,fontWeight:600,color:"#64748b"}}>Férié National</div>
+                    <div style={{fontSize:10,color:"#334155"}}>Fixe (Algérie)</div>
+                  </div>
+                  <div style={{fontSize:10,color:"#334155",padding:"4px 8px",borderRadius:6,background:"rgba(255,255,255,.03)"}}>🔒</div>
+                </div>
+              ))}
+              {/* Fériés Custom */}
+              {serviceHolidays.map(h=>(
+                <div key={h.id} style={{background:"rgba(6,182,212,.05)",border:"1px solid rgba(6,182,212,.2)",borderRadius:10,padding:12,display:"flex",alignItems:"center",gap:12}}>
+                  <div style={{width:45,textAlign:"center"}}>
+                    <div style={{fontSize:18,fontWeight:800,color:"#06b6d4"}}>{h.jour}</div>
+                    <div style={{fontSize:10,color:"#06b6d4",textTransform:"uppercase",fontWeight:700}}>{MOIS_FR[h.mois-1].slice(0,3)}</div>
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:13,fontWeight:700,color:"#f8fafc"}}>{h.label}</div>
+                    <div style={{fontSize:10,color:"#0891b2"}}>Personnel</div>
+                  </div>
+                  <button onClick={()=>delHoliday(h.id)} style={{background:"rgba(239,68,68,.1)",border:"none",color:"#ef4444",borderRadius:6,padding:"5px 8px",cursor:"pointer"}}>✕</button>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
@@ -1293,6 +1386,18 @@ FORMAT réponse informative :
                 </div>;
               })}
             </div>
+          </div>
+        )}
+
+        {tab==="historique"&&(
+          <div style={{flex:1,padding:20,overflowY:"auto"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+              <b style={{fontSize:16,color:"#94a3b8"}}>🕓 Historique des Plannings</b>
+              <button onClick={loadHisto} disabled={histoBusy} style={{...BTN,background:"rgba(255,255,255,.05)"}}>↻ Rafraîchir</button>
+            </div>
+            {histoBusy ? <div style={{color:"#475569"}}>Chargement de l'historique…</div> : 
+              <HistoList histo={histo} onLoad={loadPlan} onDelete={delPlan} groupMetaById={groupMetaById} />
+            }
           </div>
         )}
 
