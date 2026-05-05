@@ -653,7 +653,8 @@ export default function App() {
         memberRows = data || [];
       }
 
-      const mappedGroups = mapServiceData(groupRows || [], memberRows);
+      const mappedGroups = mapServiceData(groupRows || [], memberRows)
+        .filter(g => g.id !== "paramedical_jour"); // Suppression de "Paramedical du jour"
       setGroupes(mappedGroups);
       setGi(prev => mappedGroups.length === 0 ? 0 : Math.min(prev, mappedGroups.length - 1));
       if(!silent) setServiceConfigMsg(mappedGroups.length ? "" : "⚠️ Aucun groupe configuré dans Supabase.");
@@ -781,9 +782,7 @@ export default function App() {
           const ferie = isFerie(month, d);
           const k     = ck(gg.id, mi, d);
 
-          if (gg.id === "hygiene") {
-            // Géré par calcMemberRotation plus bas
-          } else if (ferie) {
+          if (ferie) {
             newConges[k] = "F";
           } else if (we) {
             newConges[k] = "RE";
