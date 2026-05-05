@@ -139,15 +139,61 @@ function getSupabaseClient() {
   return supabase;
 }
 
-function equipeDebut(y,m,ordre) {
-  const delta = (((y-1)*12+m) - ((2024-1)*12+1)) % 4;
-  return ordre[((delta%4)+4)%4];
+function equipeDebut(y, m, ordre) {
+  const delta = ((y - 1) * 12 + m - ((2024 - 1) * 12 + 1)) % 4;
+  return ordre[((delta % 4) + 4) % 4];
 }
-function calcAutoGardes(y,m,membres,ordre) {
-  const days=getDays(y,m), debut=equipeDebut(y,m,ordre), di=ordre.indexOf(debut), r={};
-  for(let d=1;d<=days;d++){
-    const eq=ordre[((d-1+di)%4+4)%4];
-    membres.forEach((mb,mi)=>{ if(mb.equipe===eq) r[`${mi}:${d}`]="G"; });
+
+/**
+ * Calcule l'équipe qui commence un mois donné en fonction de l'équipe de début d'un mois précédent.
+ */
+function calculateNextEquipeDebut(y1, m1, eq1, y2, m2, ordre) {
+  let curY = y1, curM = m1, curEq = eq1;
+  const targetTotal = y2 * 12 + m2;
+  
+  while ((curY * 12 + curM) < targetTotal) {
+    const days = getDays(curY, curM);
+    const di = ordre.indexOf(curEq);
+    curEq = ordre[((days + di) % 4 + 4) % 4];
+    curM++; if (curM > 12) { curM = 1; curY++; }
+  }
+  return curEq;
+}
+
+async function getContinuityState(serviceId, targetYear, targetMonth, ordre) {
+  try {
+    const db = getSupabaseClient();
+    // Chercher le planning le plus récent AVANT le mois cible
+    const { data, error } = await db.from("rotation_state")
+      .select("annee, mois, equipe_debut, ordre_equipes")
+      .eq("service_id", serviceId)
+      .or(`annee.lt.${targetYear},and(annee.eq.${targetYear},mois.lt.${targetMonth})`)
+      .order("annee", { ascending: false })
+      .order("mois", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (data) {
+      // Utiliser l'ordre enregistré du mois précédent s'il existe
+      const effectiveOrdre = Array.isArray(data.ordre_equipes) ? data.ordre_equipes : ordre;
+      return calculateNextEquipeDebut(data.annee, data.mois, data.equipe_debut, targetYear, targetMonth, effectiveOrdre);
+    }
+  } catch (e) {
+    console.error("Erreur continuité:", e);
+  }
+  // Fallback sur la formule fixe
+  return equipeDebut(targetYear, targetMonth, ordre);
+}
+
+function calcAutoGardes(y, m, membres, ordre, forcedEqDebut = null) {
+  const days = getDays(y, m);
+  const debut = forcedEqDebut || equipeDebut(y, m, ordre);
+  const di = ordre.indexOf(debut);
+  const r = {};
+  for (let d = 1; d <= days; d++) {
+    const eq = ordre[((d - 1 + di) % 4 + 4) % 4];
+    membres.forEach((mb, mi) => { if (mb.equipe === eq) r[`${mi}:${d}`] = "G"; });
   }
   return r;
 }
@@ -359,6 +405,7 @@ export default function App() {
   const [dragEq,   setDragEq]   = useState(null);
   const [saving,   setSaving]   = useState(false);
   const [saveMsg,  setSaveMsg]  = useState("");
+  const [planStatus, setPlanStatus] = useState("loading"); // loading, saved, new
   const [serviceConfigBusy, setServiceConfigBusy] = useState(false);
   const [serviceConfigMsg,  setServiceConfigMsg]  = useState("");
   const [personnelSaving,   setPersonnelSaving]   = useState(false);
@@ -374,12 +421,13 @@ export default function App() {
   const [chatApiKeySource,setChatApiKeySource]= useState("none");
   const [showChatApiKey,  setShowChatApiKey]  = useState(false);
   const [pdfMenu,  setPdfMenu]  = useState(false);
+  const [computedEqDebut, setComputedEqDebut] = useState(null);
   const chatEnd = useRef(null);
 
   const mn      = MOIS_FR[month-1];
   const days    = getDays(year,month);
   const g       = groupes[gi] || null;
-  const eqDebut = equipeDebut(year,month,ordre);
+  const eqDebut = computedEqDebut || equipeDebut(year, month, ordre);
   const effectiveChatApiKey       = chatApiKey.trim() || DEFAULT_CHAT_API_KEY.trim();
   const effectiveChatApiKeySource = chatApiKey.trim() ? chatApiKeySource : (DEFAULT_CHAT_API_KEY.trim() ? "env" : "none");
   const chatReady = Boolean(effectiveChatApiKey);
@@ -394,6 +442,7 @@ export default function App() {
     setTab("planning"); setYear(current.getFullYear()); setMonth(current.getMonth()+1);
     setGroupes([]); setGi(0); setConges({}); setAutoMode(true);
     setOrdre(DEFAULT_ROTATION_ORDER); setDragEq(null); setSaveMsg("");
+    setPlanStatus("loading"); setComputedEqDebut(null);
     setServiceConfigMsg(""); setHisto([]);
     setChatIn(""); setChatBusy(false);
     setChatApiKey(""); setChatApiKeyInput(""); setChatApiKeyBusy(false);
@@ -453,50 +502,94 @@ export default function App() {
   useEffect(()=>{
     if(!autoMode) return;
     const pi=groupes.findIndex(x=>x.id==="paramedical"); if(pi<0) return;
-    const r=calcAutoGardes(year,month,groupes[pi].membres,ordre);
+    const r=calcAutoGardes(year,month,groupes[pi].membres,ordre,computedEqDebut);
     setConges(prev=>{
       const n={...prev};
       Object.keys(n).filter(k=>k.startsWith("paramedical:")&&n[k]==="G").forEach(k=>delete n[k]);
       Object.entries(r).forEach(([key,code])=>{ const [mi,j]=key.split(":").map(Number); const fk=ck("paramedical",mi,j); if(!n[fk])n[fk]=code; });
       return n;
     });
-  },[year,month,ordre,autoMode]);
+  },[year,month,ordre,autoMode,computedEqDebut]);
 
   useEffect(()=>{
     if(!service?.id){ setGroupes([]); setGi(0); setServiceConfigBusy(false); setServiceConfigMsg(""); return; }
     loadServiceConfig(service.id);
   },[service?.id, loadServiceConfig]);
 
-  useEffect(()=>{
+  // ── Chargement Auto ou Fill ──
+  useEffect(() => {
     let active = true;
-    async function loadChatApiKey() {
-      if(!service?.id){
-        if(active){ setChatApiKey(""); setChatApiKeyInput(""); setChatApiKeyMsg(""); setChatApiKeySource(DEFAULT_CHAT_API_KEY.trim() ? "env" : "none"); }
-        return;
-      }
-      try{
+    async function syncPlanning() {
+      if (!service?.id || groupes.length === 0) return;
+      setPlanStatus("loading");
+      setSaveMsg("⏳ Synchronisation...");
+      
+      try {
         const db = getSupabaseClient();
-        const { data, error } = await db.from(CHAT_SETTINGS_TABLE).select("api_key")
-          .eq("service_id", service.id).eq("provider", CHAT_PROVIDER).maybeSingle();
-        if(error) throw error;
-        const remoteKey = data?.api_key || "";
-        if(!active) return;
-        setChatApiKey(remoteKey); setChatApiKeyInput(remoteKey); setChatApiKeyMsg("");
-        setChatApiKeySource(remoteKey ? "supabase" : DEFAULT_CHAT_API_KEY.trim() ? "env" : "none");
-      }catch{
-        if (active) setChatApiKeySource(DEFAULT_CHAT_API_KEY.trim() ? "env" : "none");
+        // 1. Tenter de charger le planning existant
+        const { data: planningRows, error } = await db.from("plannings").select("id,groupe_id,ordre_equipes")
+          .eq("service_id", service.id).eq("annee", year).eq("month" === "mois" ? "mois" : "mois", month); // fix for previous typo if any, but it's "mois"
+        
+        // Use "mois" correctly
+        const { data: pRows, error: pErr } = await db.from("plannings").select("id,groupe_id,ordre_equipes")
+          .eq("service_id", service.id).eq("annee", year).eq("mois", month);
+          
+        if (pErr) throw pErr;
+
+        if (pRows && pRows.length > 0) {
+          // PLANNING EXISTE -> Charger
+          const planningIds = pRows.map(r => r.id);
+          const planningGroupById = Object.fromEntries(pRows.map(r => [r.id, r.groupe_id]));
+          const storedOrdre = pRows.find(r => Array.isArray(r.ordre_equipes) && r.ordre_equipes.length)?.ordre_equipes;
+          
+          const { data: rotationRow } = await db.from("rotation_state").select("equipe_debut, ordre_equipes")
+            .eq("service_id", service.id).eq("annee", year).eq("mois", month).maybeSingle();
+
+          let congesRows = [];
+          if (planningIds.length > 0) {
+            const { data, error: ce } = await db.from("conges")
+              .select("planning_id,membre_index,membre_nom,membre_equipe,jour,code").in("planning_id", planningIds);
+            if (ce) throw ce;
+            congesRows = data || [];
+          }
+
+          if (!active) return;
+          const nc = {};
+          congesRows.forEach(row => { const groupeId = planningGroupById[row.planning_id]; if (groupeId) nc[ck(groupeId, row.membre_index, row.jour)] = row.code; });
+          
+          if (storedOrdre) setOrdre(storedOrdre);
+          else if (rotationRow?.ordre_equipes) setOrdre(rotationRow.ordre_equipes);
+          
+          if (rotationRow?.equipe_debut) setComputedEqDebut(rotationRow.equipe_debut);
+
+          setConges(nc);
+          setPlanStatus("saved");
+          setSaveMsg("");
+        } else {
+          // PLANNING N'EXISTE PAS -> Auto-Fill avec continuité
+          if (!active) return;
+          const continuityDebut = await getContinuityState(service.id, year, month, ordre);
+          if (!active) return;
+          setComputedEqDebut(continuityDebut);
+          autoFillInternal(continuityDebut);
+          setPlanStatus("new");
+          setSaveMsg("✨ Nouveau mois : planning auto-rempli.");
+        }
+      } catch (err) {
+        if (active) {
+          setPlanStatus("new");
+          setSaveMsg(`⚠️ Erreur chargement : ${err.message}`);
+        }
       }
     }
-    loadChatApiKey();
-    return ()=>{ active = false; };
-  },[service?.id]);
+    syncPlanning();
+    return () => { active = false; };
+  }, [service?.id, year, month, groupes.length]);
 
-  // ══════════════════════════════════════════════
-  //  AUTO-FILL DU PLANNING
-  // ══════════════════════════════════════════════
-  function autoFill() {
+  function autoFillInternal(forcedDebut) {
     const totalDays = getDays(year, month);
     const newConges = {};
+    const effectiveDebut = forcedDebut || computedEqDebut || equipeDebut(year, month, ordre);
 
     groupes.forEach((gg) => {
       gg.membres.forEach((m, mi) => {
@@ -511,19 +604,17 @@ export default function App() {
           } else if (ferie) {
             newConges[k] = "F";
           } else if (we) {
-            newConges[k] = "RE";  // weekend = récupération
+            newConges[k] = "RE";
           } else {
-            newConges[k] = "N";   // jour normal
+            newConges[k] = "N";
           }
         }
       });
     });
 
-    // Garde 24H : rotation auto → G pour le jour de garde, RE les autres jours
     const paraGroupe = groupes.find(x => x.id === "paramedical");
     if (paraGroupe) {
-      const gardes = calcAutoGardes(year, month, paraGroupe.membres, ordre);
-      // D'abord tous les jours = RE (ou F si férié)
+      const gardes = calcAutoGardes(year, month, paraGroupe.membres, ordre, effectiveDebut);
       paraGroupe.membres.forEach((m, mi) => {
         for (let d = 1; d <= totalDays; d++) {
           const k     = ck("paramedical", mi, d);
@@ -531,15 +622,18 @@ export default function App() {
           newConges[k] = ferie ? "F" : "RE";
         }
       });
-      // Ensuite écraser les jours de garde avec G
       Object.entries(gardes).forEach(([key, code]) => {
         const [mi, j] = key.split(":").map(Number);
         newConges[ck("paramedical", mi, j)] = code;
       });
     }
-
     setConges(newConges);
-    setSaveMsg("✅ Planning auto-rempli — vérifiez et sauvegardez.");
+  }
+
+  function autoFill() {
+    autoFillInternal();
+    setSaveMsg("✅ Planning réinitialisé — n'oubliez pas de sauvegarder.");
+    setPlanStatus("new");
   }
 
   // ── LOGIN ──
@@ -942,8 +1036,8 @@ FORMAT réponse informative :
           {MOIS_FR.map((m,i)=><option key={i} value={i+1}>{m.charAt(0).toUpperCase()+m.slice(1)}</option>)}
         </select>
         <input type="number" value={year} onChange={e=>setYear(+e.target.value)} style={{...INP,width:76}}/>
-        <div style={{padding:"3px 10px",borderRadius:20,background:"rgba(239,68,68,.12)",border:"1px solid #ef444430",fontSize:10,color:"#fca5a5"}}>
-          🔄 {mn.slice(0,3)}. → Éq.<b style={{marginLeft:4}}>{eqDebut}</b>
+        <div style={{padding:"3px 10px",borderRadius:20,background:planStatus==="new"?"rgba(59,130,246,.12)":"rgba(239,68,68,.12)",border:`1px solid ${planStatus==="new"?"#3b82f630":"#ef444430"}`,fontSize:10,color:planStatus==="new"?"#93c5fd":"#fca5a5"}}>
+          {planStatus==="new" ? "✨ Nouveau" : "💾 Enregistré"} · 🔄 {mn.slice(0,3)}. → Éq.<b style={{marginLeft:4}}>{eqDebut}</b>
         </div>
         <div style={{marginLeft:"auto",display:"flex",gap:6,alignItems:"center",position:"relative"}}>
 
