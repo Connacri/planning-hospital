@@ -584,7 +584,9 @@ export default function App() {
       if (error) throw error;
       setServiceHolidays(prev => [...prev, data].sort((a,b) => a.mois - b.mois || a.jour - b.jour));
       setHLabel("");
-    } catch (e) { alert(e.message); } finally { setHBusy(false); }
+    } catch (e) {
+      alert(isMissingRelationError(e) ? "La table 'service_holidays' est manquante dans votre base Supabase. Veuillez exécuter les migrations SQL." : e.message);
+    } finally { setHBusy(false); }
   }
 
   async function delHoliday(id) {
@@ -595,7 +597,9 @@ export default function App() {
       const { error } = await db.from("service_holidays").delete().eq("id", id);
       if (error) throw error;
       setServiceHolidays(prev => prev.filter(h => h.id !== id));
-    } catch (e) { alert(e.message); } finally { setHBusy(false); }
+    } catch (e) {
+      alert(isMissingRelationError(e) ? "La table 'service_holidays' est manquante dans votre base Supabase. Veuillez exécuter les migrations SQL." : e.message);
+    } finally { setHBusy(false); }
   }
 
   const isFerie = useCallback((m, d) => {
@@ -1647,7 +1651,7 @@ FORMAT réponse informative :
         @keyframes spin{to{transform:rotate(360deg)}}
         ::-webkit-scrollbar{width:4px;height:4px}
         ::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
-        select option{background:#0d1526}
+        select option{background:#0d1526; color: white;}
         
         @media (max-width: 768px) {
           .header-title { display: none; }
