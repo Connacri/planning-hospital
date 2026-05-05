@@ -171,12 +171,21 @@ function calculateNextEquipeDebut(y1, m1, eq1, y2, m2, ordre) {
   return curEq;
 }
 
-async function getContinuityState(serviceId, targetYear, targetMonth, ordre) {
+function calculateNextMemberStart(y1, m1, mi1, y2, m2, count) {
+  if (!count) return 0;
+  let curY = y1, curM = m1, curMi = mi1;
+  while ((curY * 12 + curM) < (y2 * 12 + m2)) {
+    curMi = (curMi + getDays(curY, curM)) % count;
+    curM++; if (curM > 12) { curM = 1; curY++; }
+  }
+  return curMi;
+}
+
+async function getContinuityState(serviceId, targetYear, targetMonth, ordre, hygieneMemberCount) {
   try {
     const db = getSupabaseClient();
-    // Chercher le planning le plus récent AVANT le mois cible
     const { data, error } = await db.from("rotation_state")
-      .select("annee, mois, equipe_debut, ordre_equipes")
+      .select("annee, mois, equipe_debut, ordre_equipes, hygiene_start_mi")
       .eq("service_id", serviceId)
       .or(`annee.lt.${targetYear},and(annee.eq.${targetYear},mois.lt.${targetMonth})`)
       .order("annee", { ascending: false })
@@ -186,15 +195,27 @@ async function getContinuityState(serviceId, targetYear, targetMonth, ordre) {
 
     if (error) throw error;
     if (data) {
-      // Utiliser l'ordre enregistré du mois précédent s'il existe
       const effectiveOrdre = Array.isArray(data.ordre_equipes) ? data.ordre_equipes : ordre;
-      return calculateNextEquipeDebut(data.annee, data.mois, data.equipe_debut, targetYear, targetMonth, effectiveOrdre);
+      const nextEq = calculateNextEquipeDebut(data.annee, data.mois, data.equipe_debut, targetYear, targetMonth, effectiveOrdre);
+      const nextHygiene = calculateNextMemberStart(data.annee, data.mois, data.hygiene_start_mi || 0, targetYear, targetMonth, hygieneMemberCount);
+      return { eqDebut: nextEq, hygieneStartMi: nextHygiene };
     }
-  } catch (e) {
-    console.error("Erreur continuité:", e);
+  } catch (e) { console.error("Erreur continuité:", e); }
+  return {
+    eqDebut: equipeDebut(targetYear, targetMonth, ordre),
+    hygieneStartMi: 0 // Fallback
+  };
+}
+
+function calcMemberRotation(y, m, membres, startMi) {
+  const days = getDays(y, m);
+  const r = {};
+  if (!membres || !membres.length) return r;
+  for (let d = 1; d <= days; d++) {
+    const mi = (startMi + d - 1) % membres.length;
+    r[`${mi}:${d}`] = "G";
   }
-  // Fallback sur la formule fixe
-  return equipeDebut(targetYear, targetMonth, ordre);
+  return r;
 }
 
 function calcAutoGardes(y, m, membres, ordre, forcedEqDebut = null) {
@@ -444,7 +465,8 @@ export default function App() {
   const [showChatApiKey,  setShowChatApiKey]  = useState(false);
   const [pdfMenu,  setPdfMenu]  = useState(false);
   const [computedEqDebut, setComputedEqDebut] = useState(null);
-  const [leaveModal, setLeaveModal] = useState(null); // { gid, mi, name }
+  const [hygieneStartMi, setHygieneStartMi] = useState(0);
+  const [leaveModal, setLeaveModal] = useState(null); // { gid, mi, name, day }
   const [lmType, setLmType] = useState("C");
   const [lmStart, setLmStart] = useState(1);
   const [lmEnd, setLmEnd] = useState(1);
@@ -489,7 +511,12 @@ export default function App() {
           .select("*").eq("service_id", serviceId).order("sort_order");
         setLeaveTypes(seeded || []);
       }
-    } catch (e) { console.error("Erreur types congés:", e); }
+    } catch (e) {
+      console.error("Erreur types congés:", e);
+      if (isMissingRelationError(e)) {
+        setSaveMsg("⚠️ Table 'service_leave_types' manquante. Vérifiez vos migrations Supabase.");
+      }
+    }
     finally { setLtBusy(false); }
   }, []);
 
@@ -521,7 +548,9 @@ export default function App() {
       if (error) throw error;
       setLeaveTypes(prev => [...prev, data]);
       setLtForm({ code: "", label: "", color: "#3b82f6" });
-    } catch (e) { alert(e.message); } finally { setLtBusy(false); }
+    } catch (e) {
+      alert(isMissingRelationError(e) ? "La table 'service_leave_types' est manquante dans votre base Supabase. Veuillez exécuter les migrations SQL." : e.message);
+    } finally { setLtBusy(false); }
   }
 
   async function delLeaveType(id) {
@@ -532,7 +561,9 @@ export default function App() {
       const { error } = await db.from("service_leave_types").delete().eq("id", id);
       if (error) throw error;
       setLeaveTypes(prev => prev.filter(t => t.id !== id));
-    } catch (e) { alert(e.message); } finally { setLtBusy(false); }
+    } catch (e) {
+      alert(isMissingRelationError(e) ? "La table 'service_leave_types' est manquante dans votre base Supabase. Veuillez exécuter les migrations SQL." : e.message);
+    } finally { setLtBusy(false); }
   }
 
   useEffect(() => {
@@ -690,7 +721,7 @@ export default function App() {
           const planningGroupById = Object.fromEntries(pRows.map(r => [r.id, r.groupe_id]));
           const storedOrdre = pRows.find(r => Array.isArray(r.ordre_equipes) && r.ordre_equipes.length)?.ordre_equipes;
           
-          const { data: rotationRow } = await db.from("rotation_state").select("equipe_debut, ordre_equipes")
+          const { data: rotationRow } = await db.from("rotation_state").select("equipe_debut, ordre_equipes, hygiene_start_mi")
             .eq("service_id", service.id).eq("annee", year).eq("mois", month).maybeSingle();
 
           let congesRows = [];
@@ -708,6 +739,7 @@ export default function App() {
           const effectiveOrdre = storedOrdre || rotationRow?.ordre_equipes || ordre;
           setOrdre(effectiveOrdre);
           setComputedEqDebut(rotationRow?.equipe_debut || equipeDebut(year, month, effectiveOrdre));
+          setHygieneStartMi(rotationRow?.hygiene_start_mi || 0);
 
           setConges(nc);
           setPlanStatus("saved");
@@ -715,10 +747,12 @@ export default function App() {
         } else {
           // PLANNING N'EXISTE PAS -> Auto-Fill avec continuité
           if (!active) return;
-          const continuityDebut = await getContinuityState(service.id, year, month, ordre);
+          const hygieneCount = groupes.find(x => x.id === "hygiene")?.membres.length || 0;
+          const cont = await getContinuityState(service.id, year, month, ordre, hygieneCount);
           if (!active) return;
-          setComputedEqDebut(continuityDebut);
-          autoFillInternal(continuityDebut);
+          setComputedEqDebut(cont.eqDebut);
+          setHygieneStartMi(cont.hygieneStartMi);
+          autoFillInternal(cont.eqDebut, cont.hygieneStartMi);
           setPlanStatus("new");
           setSaveMsg("✨ Nouveau mois : planning auto-rempli.");
         }
@@ -733,10 +767,11 @@ export default function App() {
     return () => { active = false; };
   }, [service?.id, year, month, groupes.length]);
 
-  function autoFillInternal(forcedDebut) {
+  function autoFillInternal(forcedDebut, forcedHygieneStart) {
     const totalDays = getDays(year, month);
     const newConges = {};
     const effectiveDebut = forcedDebut || computedEqDebut || equipeDebut(year, month, ordre);
+    const effectiveHygieneStart = (forcedHygieneStart !== undefined) ? forcedHygieneStart : hygieneStartMi;
 
     groupes.forEach((gg) => {
       gg.membres.forEach((m, mi) => {
@@ -746,8 +781,8 @@ export default function App() {
           const ferie = isFerie(month, d);
           const k     = ck(gg.id, mi, d);
 
-          if (gg.id === "paramedical") {
-            // Géré séparément ci-dessous
+          if (gg.id === "hygiene") {
+            // Géré par calcMemberRotation plus bas
           } else if (ferie) {
             newConges[k] = "F";
           } else if (we) {
@@ -759,21 +794,27 @@ export default function App() {
       });
     });
 
-    const paraGroupe = groupes.find(x => x.id === "paramedical");
-    if (paraGroupe) {
-      const gardes = calcAutoGardes(year, month, paraGroupe.membres, ordre, effectiveDebut);
-      paraGroupe.membres.forEach((m, mi) => {
-        for (let d = 1; d <= totalDays; d++) {
-          const k     = ck("paramedical", mi, d);
-          const ferie = isFerie(month, d);
-          newConges[k] = ferie ? "F" : "RE";
-        }
-      });
+    // Rotation Equipes (Médecins, etc.)
+    groupes.forEach(gg => {
+      if (gg.hasEquipe && gg.id !== "hygiene") {
+        const gardes = calcAutoGardes(year, month, gg.membres, ordre, effectiveDebut);
+        Object.entries(gardes).forEach(([key, code]) => {
+          const [mi, j] = key.split(":").map(Number);
+          newConges[ck(gg.id, mi, j)] = code;
+        });
+      }
+    });
+
+    // Rotation Membres (Hygiène)
+    const hygGroup = groupes.find(x => x.id === "hygiene");
+    if (hygGroup) {
+      const gardes = calcMemberRotation(year, month, hygGroup.membres, effectiveHygieneStart);
       Object.entries(gardes).forEach(([key, code]) => {
         const [mi, j] = key.split(":").map(Number);
-        newConges[ck("paramedical", mi, j)] = code;
+        newConges[ck("hygiene", mi, j)] = code;
       });
     }
+
     setConges(newConges);
   }
 
@@ -796,6 +837,18 @@ export default function App() {
       setConges({});
       setGroupes([]);
     }
+  }
+
+  function applyLeave() {
+    if (!leaveModal) return;
+    const { gid, mi } = leaveModal;
+    const nc = { ...conges };
+    for (let d = lmStart; d <= lmEnd; d++) {
+      nc[ck(gid, mi, d)] = lmType;
+    }
+    setConges(nc);
+    setLeaveModal(null);
+    setSaveMsg("⏳ Congé appliqué localement. N'oubliez pas de sauvegarder.");
   }
 
   // ── LOGIN ──
@@ -974,6 +1027,7 @@ export default function App() {
       }
       const { error: rotationError } = await db.from("rotation_state").upsert({
         service_id: service.id, annee: year, mois: month, equipe_debut: eqDebut, ordre_equipes: ordre,
+        hygiene_start_mi: hygieneStartMi,
       }, { onConflict: "service_id,annee,mois" });
       if (rotationError) throw rotationError;
 
@@ -1313,9 +1367,16 @@ FORMAT réponse informative :
                         {g.hasEquipe&&<td style={{...PTD,textAlign:"center",color:g.color,fontWeight:700,fontSize:10}}>{m.equipe}</td>}
                         {Array.from({length:days},(_,i)=>{
                           const d=i+1,dw=getDow(year,month,d),we=isWE(dw),code=conges[ck(g.id,mi,d)]||"",ci=leaveTypes.find(c=>c.code===code),isAuto=autoMode&&g.hasEquipe&&code==="G",ferie=isFerie(month,d);
-                          return <td key={d} style={{...PTD,width:21,padding:0,background:ferie?"rgba(0,40,40,.5)":we?"rgba(40,12,0,.5)":isAuto?"rgba(239,68,68,.05)":"transparent"}}>
-                            <input value={code} maxLength={3} onChange={e=>setCode(g.id,mi,d,e.target.value)}
-                              style={{width:21,height:20,border:"none",background:"transparent",textAlign:"center",fontSize:9,fontWeight:700,outline:"none",color:ci?ci.color:ferie?"#06b6d4":we?"#2d1a0a":"#334155",fontStyle:isAuto?"italic":"normal",cursor:"text"}}/>
+                          return <td key={d}
+                            onClick={() => {
+                              setLeaveModal({ gid: g.id, mi, name: m.nom, day: d });
+                              setLmStart(d);
+                              setLmEnd(d);
+                              setLmType(code || "C");
+                            }}
+                            style={{...PTD,width:21,padding:0,background:ferie?"rgba(0,40,40,.5)":we?"rgba(40,12,0,.5)":isAuto?"rgba(239,68,68,.05)":"transparent",cursor:"pointer"}}>
+                            <input value={code} maxLength={3} readOnly
+                              style={{width:21,height:20,border:"none",background:"transparent",textAlign:"center",fontSize:9,fontWeight:700,outline:"none",color:ci?ci.color:ferie?"#06b6d4":we?"#2d1a0a":"#334155",fontStyle:isAuto?"italic":"normal",pointerEvents:"none"}}/>
                           </td>;
                         })}
                       </tr>
@@ -1596,6 +1657,53 @@ FORMAT réponse informative :
           .planning-input { width: 18px !important; height: 18px !important; font-size: 8px !important; }
         }
       `}</style>
+
+      {/* ── MODAL CONGÉS (CRUD Membre) ── */}
+      {leaveModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.8)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:20}}>
+          <div style={{background:"#0f172a",border:"1px solid rgba(255,255,255,.1)",borderRadius:16,width:"100%",maxWidth:400,padding:24,boxShadow:"0 20px 50px rgba(0,0,0,.5)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
+              <div>
+                <div style={{fontSize:18,fontWeight:800,color:"#f8fafc"}}>{leaveModal.name}</div>
+                <div style={{fontSize:12,color:"#64748b"}}>Gérer les congés / activités</div>
+              </div>
+              <button onClick={()=>setLeaveModal(null)} style={{background:"transparent",border:"none",color:"#64748b",fontSize:20,cursor:"pointer"}}>✕</button>
+            </div>
+
+            <div style={{display:"flex",flexDirection:"column",gap:16}}>
+              <div>
+                <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>Type d'activité</div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6}}>
+                  {leaveTypes.map(t=>(
+                    <button key={t.id} onClick={()=>setLmType(t.code)} style={{padding:"8px 4px",borderRadius:6,border:`1px solid ${lmType===t.code?t.color:"rgba(255,255,255,.05)"}`,background:lmType===t.code?`${t.color}22`:"rgba(255,255,255,.02)",color:lmType===t.code?t.color:"#475569",fontSize:10,fontWeight:700,cursor:"pointer"}}>
+                      {t.code}
+                    </button>
+                  ))}
+                  <button onClick={()=>setLmType("")} style={{padding:"8px 4px",borderRadius:6,border:`1px solid ${lmType===""?"#64748b":"rgba(255,255,255,.05)"}`,background:lmType===""?"rgba(100,116,139,.1)":"rgba(255,255,255,.02)",color:"#64748b",fontSize:10,fontWeight:700,cursor:"pointer"}}>
+                    VIDER
+                  </button>
+                </div>
+              </div>
+
+              <div style={{display:"flex",gap:10}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>Du (jour)</div>
+                  <input type="number" min={1} max={days} value={lmStart} onChange={e=>setLmStart(+e.target.value)} style={{...INP,width:"100%"}}/>
+                </div>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>Au (jour)</div>
+                  <input type="number" min={1} max={days} value={lmEnd} onChange={e=>setLmEnd(+e.target.value)} style={{...INP,width:"100%"}}/>
+                </div>
+              </div>
+
+              <div style={{marginTop:8,display:"flex",gap:10}}>
+                <button onClick={()=>setLeaveModal(null)} style={{flex:1,...BTN,background:"rgba(255,255,255,.05)",color:"#64748b"}}>Annuler</button>
+                <button onClick={applyLeave} style={{flex:2,...BTN,background:"linear-gradient(135deg,#2563eb,#0891b2)"}}>Appliquer</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
