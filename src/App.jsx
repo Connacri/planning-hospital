@@ -395,7 +395,6 @@ function buildPdfPlanning(svc, groupes, conges, year, month, leaveTypes) {
   .CM { background:#F8BBD0 !important; color:#880E4F; }
   .M  { background:#FCE4EC !important; color:#880E4F; }
   .F  { background:#E0F7FA !important; color:#006064; font-weight:700; }
-`;
   .leg { display: flex; justify-content: space-between; font-size: 6px; color: #333; margin-top: 4px; border-top: 0.3px solid #ccc; padding-top: 3px; }
   .nb { font-size: 5.5px; color: #2E5DA8; margin-top: 2px; }
 </style></head><body>${pages}</body></html>`;
@@ -1425,6 +1424,7 @@ FORMAT réponse informative :
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:12}}>
                 <div style={{fontSize:12,fontWeight:700,color:g.color,textTransform:"uppercase"}}>{g.label}</div>
                 <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                  <button onClick={resetGroups} disabled={serviceConfigBusy||personnelSaving} style={{...BTN,background:"rgba(239,68,68,.1)",color:"#f87171",fontSize:11}} title="Réorganiser avec la nouvelle structure standard (Supprime et recrée les groupes)">⚠️ Restructurer</button>
                   <button onClick={()=>loadServiceConfig(service.id,{seedIfEmpty:false})} disabled={serviceConfigBusy||personnelSaving} style={{...BTN,background:"rgba(255,255,255,.05)",color:"#cbd5e1",fontSize:11,opacity:(serviceConfigBusy||personnelSaving)?0.7:1}}>↻ Recharger</button>
                   <button onClick={savePersonnelConfig} disabled={serviceConfigBusy||personnelSaving} style={{...BTN,background:`linear-gradient(135deg,${g.color},#0891b2)`,fontSize:11,opacity:(serviceConfigBusy||personnelSaving)?0.7:1}}>{personnelSaving?"⏳…":"Sauver le personnel"}</button>
                 </div>
