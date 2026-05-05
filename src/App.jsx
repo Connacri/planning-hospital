@@ -23,11 +23,11 @@ const CODES = [
   { code:"F",  label:"Férié",         color:"#06b6d4" },
 ];
 const DEFAULT_ROTATION_ORDER = ["A","B","C","D"];
-const CHAT_PROVIDER  = "gemini";
-const CHAT_MODEL     = "gemini-2.0-flash";
-const CHAT_API_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${CHAT_MODEL}:generateContent`;
+const CHAT_PROVIDER  = "groq";
+const CHAT_MODEL     = "llama-3.3-70b-versatile";   // gratuit · 14 400 req/jour
+const CHAT_API_URL   = "https://api.groq.com/openai/v1/chat/completions";
 const CHAT_SETTINGS_TABLE = "service_ai_settings";
-const DEFAULT_CHAT_API_KEY = process.env.REACT_APP_GEMINI_API_KEY || "";
+const DEFAULT_CHAT_API_KEY = process.env.REACT_APP_GROQ_API_KEY || "";
 
 // ══════════════════════════════════════════════
 //  HELPERS
@@ -90,26 +90,30 @@ function isMissingRelationError(error) {
   const msg = `${error?.message || ""} ${error?.details || ""}`.toLowerCase();
   return error?.code === "PGRST205" || msg.includes("could not find the table") || msg.includes("does not exist");
 }
-async function generateWithGemini({ apiKey, systemPrompt, userPrompt }) {
-  const res = await fetch(
-    `${CHAT_API_URL}?key=${apiKey.trim()}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ parts: [{ text: userPrompt }] }],
-        generationConfig: { maxOutputTokens: 800 },
-      }),
-    }
-  );
+async function generateWithGroq({ apiKey, systemPrompt, userPrompt }) {
+  const res = await fetch(CHAT_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey.trim()}`,
+    },
+    body: JSON.stringify({
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user",   content: userPrompt   },
+      ],
+      max_tokens: 800,
+      temperature: 0.2,
+    }),
+  });
 
   const data = await res.json();
   if (!res.ok) {
-    throw new Error(data?.error?.message || `Erreur Gemini (${res.status})`);
+    throw new Error(data?.error?.message || `Erreur Groq (${res.status})`);
   }
 
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  return data?.choices?.[0]?.message?.content || "";
 }
 
 function getSupabaseClient() {
@@ -1061,7 +1065,7 @@ export default function App() {
   function addA(t){ setMsgs(p=>[...p,{r:"a",t}]); }
   async function saveChatApiKey(){
     const nextKey = chatApiKeyInput.trim();
-    if(!nextKey){ setChatApiKeyMsg("❌ Entrez une clé API Gemini."); return; }
+    if(!nextKey){ setChatApiKeyMsg("❌ Entrez une Clé API Groq."); return; }
     if(!service?.id){ setChatApiKeyMsg("❌ Aucun service actif."); return; }
     const previousKey = chatApiKey;
     const previousSource = chatApiKeySource;
@@ -1139,7 +1143,7 @@ export default function App() {
   }
 async function sendChat(){
   if(!chatReady){
-    setChatApiKeyMsg("❌ Configurez une clé API Gemini avant d'utiliser le chat.");
+    setChatApiKeyMsg("❌ Configurez une Clé API Groq avant d'utiliser le chat.");
     return;
   }
   if(!chatIn.trim()||chatBusy) return;
@@ -1169,7 +1173,7 @@ Si modification→JSON:{"action":"update","updates":[{"gid":"...","mi":0,"jour":
 Sinon→JSON:{"action":"msg","msg":"..."}`;
 
   try {
-    const raw = await generateWithGemini({
+      const raw = await generateWithGroq({
       apiKey: effectiveChatApiKey,
       systemPrompt,
       userPrompt: txt,
@@ -1479,7 +1483,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
             <div style={{marginBottom:12,background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.08)",borderRadius:10,padding:14}}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap",marginBottom:10}}>
                 <div>
-                  <div style={{fontSize:12,fontWeight:700,color:"#93c5fd"}}>Clé API Gemini</div>
+                  <div style={{fontSize:12,fontWeight:700,color:"#93c5fd"}}>Clé API Groq</div>
                   <div style={{fontSize:10,color:"#475569",marginTop:2}}>
                     {chatReady ? `Configurée · ${chatKeyPreview(effectiveChatApiKey)}` : "Aucune clé configurée"}
                     {effectiveChatApiKeySource==="supabase" ? " · source Supabase" : effectiveChatApiKeySource==="env" ? " · source .env" : ""}
@@ -1496,7 +1500,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
                     type={showChatApiKey ? "text" : "password"}
                     value={chatApiKeyInput}
                     onChange={e=>setChatApiKeyInput(e.target.value)}
-                    placeholder="AIzaSy-..."
+                    placeholder="gsk_..."
                     style={{...INP,flex:1,padding:"9px 11px",fontFamily:"monospace"}}
                   />
                   <button
@@ -1523,7 +1527,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
                   ✕
                 </button>
                 <a
-                  href="https://aistudio.google.com/app/apikey"
+                  href="https://console.groq.com/keys"
                   target="_blank"
                   rel="noreferrer"
                   style={{fontSize:11,color:"#60a5fa",textDecoration:"none"}}
@@ -1533,7 +1537,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
               </div>
 
               <div style={{fontSize:10,color:"#475569",marginTop:8}}>
-                Le bouton Sauver persiste la clé dans Supabase si la table dédiée existe. Si aucune clé n'est enregistrée ici, l'app peut utiliser `REACT_APP_GEMINI_API_KEY`.
+                Le bouton Sauver persiste la clé dans Supabase si la table dédiée existe. Si aucune clé n'est enregistrée ici, l'app peut utiliser `REACT_APP_GROQ_API_KEY`.
               </div>
               {chatApiKeyMsg&&<div style={{marginTop:10,padding:"8px 10px",borderRadius:8,background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.06)",fontSize:11,color:"#cbd5e1"}}>{chatApiKeyMsg}</div>}
             </div>
@@ -1560,7 +1564,7 @@ Sinon→JSON:{"action":"msg","msg":"..."}`;
                 onChange={e=>setChatIn(e.target.value)}
                 onKeyDown={e=>e.key==="Enter"&&sendChat()}
                 disabled={!chatReady}
-                placeholder={chatReady ? "Parlez à l'agent…" : "Configurez une clé API Gemini pour activer le chat"}
+                placeholder={chatReady ? "Parlez à l'agent…" : "Configurez une Clé API Groq pour activer le chat"}
                 style={{flex:1,background:"transparent",border:"none",color:chatReady?"#e2e8f0":"#64748b",fontSize:12,outline:"none"}}
               />
               <button onClick={sendChat} disabled={!chatReady||chatBusy||!chatIn.trim()} style={{...BTN,fontSize:11,background:!chatReady||chatBusy||!chatIn.trim()?"rgba(255,255,255,.04)":"linear-gradient(135deg,#1d4ed8,#0891b2)",color:!chatReady||chatBusy||!chatIn.trim()?"#475569":"white"}}>{chatBusy?"…":"↵"}</button>
