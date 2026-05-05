@@ -44,6 +44,8 @@ set search_path = public
 as $$
 declare
   medecins_id uuid;
+  surveillance_id uuid;
+  paramedical_jour_id uuid;
   administratifs_id uuid;
   paramedical_id uuid;
   hygiene_id uuid;
@@ -60,40 +62,57 @@ begin
     return;
   end if;
 
+  -- 1. Groupe Médecins
   insert into public.service_groups (service_id, code, label, subtitle, color, has_equipe, sort_order)
-  values (target_service_id, 'medecins', '👨‍⚕️ Médecins', '08h–16h — Personnel Médical', '#3b82f6', false, 0)
+  values (target_service_id, 'medecins', '🩺 Médecins', 'Praticiens Spécialistes', '#3b82f6', false, 0)
   returning id into medecins_id;
 
+  -- 2. Groupe Surveillance & Encadrement
   insert into public.service_groups (service_id, code, label, subtitle, color, has_equipe, sort_order)
-  values (target_service_id, 'administratifs', '🗂️ Administration', '08h–16h', '#8b5cf6', false, 1)
+  values (target_service_id, 'surveillance', '📋 Surveillance', 'Encadrement & I.SSP', '#f43f5e', false, 1)
+  returning id into surveillance_id;
+
+  -- 3. Groupe Paramedical Jour
+  insert into public.service_groups (service_id, code, label, subtitle, color, has_equipe, sort_order)
+  values (target_service_id, 'paramedical_jour', '🏥 Para. Jour', 'Psychologue & Aide Soignante', '#10b981', false, 2)
+  returning id into paramedical_jour_id;
+
+  -- 4. Groupe Administration
+  insert into public.service_groups (service_id, code, label, subtitle, color, has_equipe, sort_order)
+  values (target_service_id, 'administratifs', '🗂️ Administration', 'Secrétariat & Technique', '#8b5cf6', false, 3)
   returning id into administratifs_id;
 
+  -- 5. Groupe Rotation Paramédical (Garde 24h)
   insert into public.service_groups (service_id, code, label, subtitle, color, has_equipe, sort_order)
-  values (target_service_id, 'paramedical', '🏥 Paramédical', '24h', '#10b981', true, 2)
+  values (target_service_id, 'paramedical', '🔄 Para. Garde', 'Rotation 24h', '#06b6d4', true, 4)
   returning id into paramedical_id;
 
+  -- 6. Groupe Hygiène
   insert into public.service_groups (service_id, code, label, subtitle, color, has_equipe, sort_order)
-  values (target_service_id, 'hygiene', '🧹 Hygiène', 'Agents d''Hygiène — 12h', '#f59e0b', false, 3)
+  values (target_service_id, 'hygiene', '🧹 Hygiène', 'Rotation 24h', '#f59e0b', true, 5)
   returning id into hygiene_id;
 
+  -- Insert Demo Members
   insert into public.service_members (group_id, nom, grade, equipe, sort_order)
-  values
+  values 
     (medecins_id, 'Dr. BENALI Karim', 'Médecin Rhumatologue', null, 0),
     (medecins_id, 'Dr. MAMMERI Salima', 'Médecin Généraliste', null, 1),
     (medecins_id, 'Dr. KACI Omar', 'Médecin Spécialiste', null, 2),
+    
+    (surveillance_id, 'BELHADJ Sonia', 'Surveillant Médical', null, 0),
+    (surveillance_id, 'BOUABDALLAH Ali', 'I.SSP', null, 1),
+
+    (paramedical_jour_id, 'ZAHI Fatiha', 'Psychologue', null, 0),
+    (paramedical_jour_id, 'RAIS Houria', 'Aide Soignante', null, 1),
+
     (administratifs_id, 'BOUZIANE Karima', 'Secrétaire Médicale', null, 0),
     (administratifs_id, 'MEDJDOUB Sofiane', 'Technicien Adm.', null, 1),
-    (administratifs_id, 'RAIS Houria', 'Aide Soignante', null, 2),
+
     (paramedical_id, 'HAMDI Nadia', 'Infirmier Principal', 'A', 0),
     (paramedical_id, 'MEZIANI Youcef', 'Infirmier', 'B', 1),
     (paramedical_id, 'BRAHIMI Fatima', 'Infirmière', 'C', 2),
     (paramedical_id, 'AISSAOUI Rachid', 'Infirmier', 'D', 3),
-  update public.service_groups 
-  set has_equipe = true, subtitle = 'Agents d''Hygiène — Rotation 24h'
-  where code = 'hygiene' and service_id = target_service_id;
 
-  insert into public.service_members (group_id, nom, grade, equipe, sort_order)
-  values 
     (hygiene_id, 'OULD ALI Nassima', 'Agent d''Hygiène', 'A', 0),
     (hygiene_id, 'FERHAT Mourad', 'Agent d''Hygiène', 'B', 1),
     (hygiene_id, 'ZIANI Amine', 'Agent d''Hygiène', 'C', 2),

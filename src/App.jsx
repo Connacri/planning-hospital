@@ -841,6 +841,23 @@ export default function App() {
     setServiceConfigMsg("");
     setGroupes(p=>p.map((gg,x)=>x!==i?gg:{...gg,membres:gg.membres.map((m,j)=>j!==mi?m:{...m,[f]:v})}));
   }
+  function moveM(i,mi,targetGroupId){
+    const member = groupes[i].membres[mi];
+    const targetGroupIndex = groupes.findIndex(gg=>gg.id===targetGroupId);
+    if(targetGroupIndex<0) return;
+    
+    setGroupes(p=>{
+      const next = [...p];
+      // Supprimer du groupe source
+      next[i] = {...next[i], membres: next[i].membres.filter((_,j)=>j!==mi)};
+      // Ajouter au groupe cible
+      next[targetGroupIndex] = {...next[targetGroupIndex], membres: [...next[targetGroupIndex].membres, {...member, equipe: next[targetGroupIndex].hasEquipe ? DEFAULT_ROTATION_ORDER[0] : null}]};
+      return next;
+    });
+    setConges(prev=>shiftCongesAfterMemberDelete(prev, groupes[i].id, mi));
+    setServiceConfigMsg(`↪️ ${member.nom} déplacé vers ${groupes[targetGroupIndex].label}`);
+  }
+
   function dropEq(t){ if(!dragEq||dragEq===t)return; setOrdre(p=>{ const a=[...p],fi=a.indexOf(dragEq),ti=a.indexOf(t); a.splice(fi,1);a.splice(ti,0,dragEq);return a; }); setDragEq(null); }
 
   async function savePersonnelConfig(){
@@ -1424,7 +1441,15 @@ FORMAT réponse informative :
                       <td style={TD}><input value={m.nom} onChange={e=>updM(gi,mi,"nom",e.target.value)} style={{...INP,width:"100%"}}/></td>
                       <td style={TD}><input value={m.grade} onChange={e=>updM(gi,mi,"grade",e.target.value)} style={{...INP,width:"100%"}}/></td>
                       {g.hasEquipe&&<td style={TD}><select value={m.equipe||"A"} onChange={e=>updM(gi,mi,"equipe",e.target.value)} style={{...SEL,width:54}}>{ordre.map(q=><option key={q}>{q}</option>)}</select></td>}
-                      <td style={{...TD,textAlign:"center"}}><button onClick={()=>delM(gi,mi)} style={{background:"rgba(239,68,68,.12)",border:"none",color:"#f87171",borderRadius:4,padding:"2px 6px",cursor:"pointer"}}>✕</button></td>
+                      <td style={{...TD,textAlign:"center"}}>
+                        <div style={{display:"flex",gap:4,justifyContent:"center"}}>
+                          <select onChange={e=>moveM(gi,mi,e.target.value)} value="" style={{...SEL,width:32,padding:2,fontSize:10}} title="Déplacer vers groupe...">
+                            <option value="" disabled>↪️</option>
+                            {groupes.map(gg=>gg.id!==g.id&&<option key={gg.id} value={gg.id}>{gg.label}</option>)}
+                          </select>
+                          <button onClick={()=>delM(gi,mi)} style={{background:"rgba(239,68,68,.12)",border:"none",color:"#f87171",borderRadius:4,padding:"2px 6px",cursor:"pointer"}}>✕</button>
+                        </div>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -1530,7 +1555,19 @@ FORMAT réponse informative :
           </div>
         )}
       </div>
-      <style>{`@keyframes spin{to{transform:rotate(360deg)}}::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}select option{background:#0d1526}`}</style>
+      <style>{`
+        @keyframes spin{to{transform:rotate(360deg)}}
+        ::-webkit-scrollbar{width:4px;height:4px}
+        ::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
+        select option{background:#0d1526}
+        
+        @media (max-width: 768px) {
+          .header-title { display: none; }
+          .tabs-container { overflow-x: auto; white-space: nowrap; }
+          .planning-table { font-size: 8px !important; }
+          .planning-input { width: 18px !important; height: 18px !important; font-size: 8px !important; }
+        }
+      `}</style>
     </div>
   );
 }
