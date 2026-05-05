@@ -470,6 +470,8 @@ export default function App() {
   const [lmType, setLmType] = useState("C");
   const [lmStart, setLmStart] = useState(1);
   const [lmEnd, setLmEnd] = useState(1);
+  const [lmMode, setLmMode] = useState("range"); // "range" ou "duration"
+  const [lmDuration, setLmDuration] = useState(1);
   const chatEnd = useRef(null);
 
   const mn      = MOIS_FR[month-1];
@@ -846,8 +848,12 @@ export default function App() {
     if (!leaveModal) return;
     const { gid, mi } = leaveModal;
     const nc = { ...conges };
-    for (let d = lmStart; d <= lmEnd; d++) {
-      nc[ck(gid, mi, d)] = lmType;
+    const endDay = lmMode === "range" ? lmEnd : (lmStart + lmDuration - 1);
+
+    for (let d = lmStart; d <= Math.min(endDay, days); d++) {
+      const k = ck(gid, mi, d);
+      if (!lmType) delete nc[k];
+      else nc[k] = lmType;
     }
     setConges(nc);
     setLeaveModal(null);
@@ -1668,7 +1674,7 @@ FORMAT réponse informative :
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
               <div>
                 <div style={{fontSize:18,fontWeight:800,color:"#f8fafc"}}>{leaveModal.name}</div>
-                <div style={{fontSize:12,color:"#64748b"}}>Gérer les congés / activités</div>
+                <div style={{fontSize:12,color:"#64748b"}}>Planning de {mn} {year}</div>
               </div>
               <button onClick={()=>setLeaveModal(null)} style={{background:"transparent",border:"none",color:"#64748b",fontSize:20,cursor:"pointer"}}>✕</button>
             </div>
@@ -1688,15 +1694,27 @@ FORMAT réponse informative :
                 </div>
               </div>
 
+              <div style={{display:"flex",background:"rgba(255,255,255,.03)",padding:4,borderRadius:8}}>
+                <button onClick={()=>setLmMode("range")} style={{flex:1,padding:"6px",border:"none",borderRadius:6,fontSize:10,fontWeight:600,cursor:"pointer",background:lmMode==="range"?"#334155":"transparent",color:lmMode==="range"?"white":"#64748b"}}>Dates (Du / Au)</button>
+                <button onClick={()=>setLmMode("duration")} style={{flex:1,padding:"6px",border:"none",borderRadius:6,fontSize:10,fontWeight:600,cursor:"pointer",background:lmMode==="duration"?"#334155":"transparent",color:lmMode==="duration"?"white":"#64748b"}}>Durée (Nb jours)</button>
+              </div>
+
               <div style={{display:"flex",gap:10}}>
                 <div style={{flex:1}}>
-                  <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>Du (jour)</div>
+                  <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>Début (jour)</div>
                   <input type="number" min={1} max={days} value={lmStart} onChange={e=>setLmStart(+e.target.value)} style={{...INP,width:"100%"}}/>
                 </div>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>Au (jour)</div>
-                  <input type="number" min={1} max={days} value={lmEnd} onChange={e=>setLmEnd(+e.target.value)} style={{...INP,width:"100%"}}/>
-                </div>
+                {lmMode === "range" ? (
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>Fin (jour)</div>
+                    <input type="number" min={1} max={days} value={lmEnd} onChange={e=>setLmEnd(+e.target.value)} style={{...INP,width:"100%"}}/>
+                  </div>
+                ) : (
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>Nombre de jours</div>
+                    <input type="number" min={1} max={31} value={lmDuration} onChange={e=>setLmDuration(+e.target.value)} style={{...INP,width:"100%"}}/>
+                  </div>
+                )}
               </div>
 
               <div style={{marginTop:8,display:"flex",gap:10}}>
