@@ -783,6 +783,21 @@ export default function App() {
     setPlanStatus("new");
   }
 
+  function resetWorkspace(svc) {
+    if (svc) {
+      setService(svc);
+      setLoggedIn(true);
+      setConges({});
+      setGroupes([]);
+      setTab("planning");
+    } else {
+      setService(null);
+      setLoggedIn(false);
+      setConges({});
+      setGroupes([]);
+    }
+  }
+
   // ── LOGIN ──
   function doLogin(svc) { resetWorkspace(svc); setLoginMsg(""); }
   async function joinService() {
@@ -858,6 +873,19 @@ export default function App() {
   }
 
   function dropEq(t){ if(!dragEq||dragEq===t)return; setOrdre(p=>{ const a=[...p],fi=a.indexOf(dragEq),ti=a.indexOf(t); a.splice(fi,1);a.splice(ti,0,dragEq);return a; }); setDragEq(null); }
+
+  async function resetGroups() {
+    if (!service?.id || !window.confirm("⚠️ Voulez-vous vraiment réinitialiser les groupes ? Cela supprimera le personnel actuel.")) return;
+    setServiceConfigBusy(true); setServiceConfigMsg("⏳ Réinitialisation…");
+    try {
+      const db = getSupabaseClient();
+      const { error: delError } = await db.from("service_groups").delete().eq("service_id", service.id);
+      if (delError) throw delError;
+      await loadServiceConfig(service.id);
+      setServiceConfigMsg("✅ Groupes réinitialisés.");
+    } catch (e) { setServiceConfigMsg(`❌ ${dbError(e, "Erreur réinitialisation")}`); }
+    finally { setServiceConfigBusy(false); }
+  }
 
   async function savePersonnelConfig(){
     if(!service?.id) return;
