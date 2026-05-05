@@ -140,20 +140,31 @@ function getSupabaseClient() {
 }
 
 function equipeDebut(y, m, ordre) {
-  const delta = ((y - 1) * 12 + m - ((2024 - 1) * 12 + 1)) % 4;
-  return ordre[((delta % 4) + 4) % 4];
+  // Epoch: Janvier 2024 commence avec l'équipe à l'index 0 (souvent 'A')
+  // On utilise le calcul de continuité depuis cette époque pour un réalisme accru
+  return calculateNextEquipeDebut(2024, 1, ordre[0], y, m, ordre);
 }
 
 /**
  * Calcule l'équipe qui commence un mois donné en fonction de l'équipe de début d'un mois précédent.
  */
 function calculateNextEquipeDebut(y1, m1, eq1, y2, m2, ordre) {
-  let curY = y1, curM = m1, curEq = eq1;
   const targetTotal = y2 * 12 + m2;
+  const currentTotal = y1 * 12 + m1;
   
+  if (targetTotal === currentTotal) return eq1;
+  
+  // Si on cherche dans le passé, on utilise la formule fixe par simplicité
+  if (targetTotal < currentTotal) {
+    const delta = (targetTotal - ((2024 * 12) + 1));
+    return ordre[((delta % 4) + 4) % 4];
+  }
+
+  let curY = y1, curM = m1, curEq = eq1;
   while ((curY * 12 + curM) < targetTotal) {
     const days = getDays(curY, curM);
     const di = ordre.indexOf(curEq);
+    if (di === -1) break; // Sécurité
     curEq = ordre[((days + di) % 4 + 4) % 4];
     curM++; if (curM > 12) { curM = 1; curY++; }
   }
@@ -305,9 +316,15 @@ function buildPdfListe(svc, groupes, year, month) {
 // ══════════════════════════════════════════════
 //  PDF 2 — PLANNING D'ACTIVITÉ (PAYSAGE A4)
 // ══════════════════════════════════════════════
-function buildPdfPlanning(svc, groupes, conges, year, month, ordre) {
+function buildPdfPlanning(svc, groupes, conges, year, month, leaveTypes) {
   const mn   = MOIS_FR[month - 1];
   const days = getDays(year, month);
+  
+  // Générer le CSS dynamique pour les types de congés
+  const dynamicCss = leaveTypes.map(t => `
+    .${t.code} { background:${t.color}22 !important; color:${t.color}; font-weight:700; }
+  `).join("");
+
   const pages = groupes.map(gg => {
     let dayHdrs = "";
     for (let d = 1; d <= days; d++) {
@@ -371,8 +388,14 @@ function buildPdfPlanning(svc, groupes, conges, year, month, ordre) {
   .ce { font-size:6px; font-weight:bold; color:#1B3A6B; }
   .cday { font-size:6px; height:13px; }
   .cwe  { background:#EDEDED; color:#777; }
-  ${ACT_CSS}
-  tbody tr:nth-child(even) td:not(.G):not(.RE):not(.C):not(.CM):not(.M):not(.F):not(.cwe) { background: #EBF3FC; }
+  ${dynamicCss}
+  .G  { background:#FFCDD2 !important; color:#B71C1C; }
+  .RE { background:#FFF9C4 !important; color:#7B6000; }
+  .C  { background:#C8E6C9 !important; color:#1B5E20; }
+  .CM { background:#F8BBD0 !important; color:#880E4F; }
+  .M  { background:#FCE4EC !important; color:#880E4F; }
+  .F  { background:#E0F7FA !important; color:#006064; font-weight:700; }
+`;
   .leg { display: flex; justify-content: space-between; font-size: 6px; color: #333; margin-top: 4px; border-top: 0.3px solid #ccc; padding-top: 3px; }
   .nb { font-size: 5.5px; color: #2E5DA8; margin-top: 2px; }
 </style></head><body>${pages}</body></html>`;
@@ -440,63 +463,66 @@ export default function App() {
     : { bg:"rgba(239,68,68,.10)", border:"rgba(239,68,68,.28)", color:"#fca5a5" };
   const groupMetaById = Object.fromEntries(groupes.map(group => [group.id, { label: group.label, color: group.color }]));
 
-  const [serviceHolidays, setServiceHolidays] = useState([]);
-  const [hMonth, setHMonth] = useState(month);
-  const [hDay, setHDay] = useState(1);
-  const [hLabel, setHLabel] = useState("");
-  const [hBusy, setHBusy] = useState(false);
+  const [leaveTypes, setLeaveTypes] = useState([]);
+  const [ltBusy, setLtBusy] = useState(false);
+  const [ltForm, setLtForm] = useState({ code: "", label: "", color: "#3b82f6" });
 
-  const isFerie = (m, d) => 
-    isFerieAlg(m, d) || serviceHolidays.some(h => h.mois === m && h.jour === d);
-
-  function resetWorkspace(nextService = null) {
-    const current = new Date();
-    setService(nextService); setLoggedIn(Boolean(nextService));
-    setTab("planning"); setYear(current.getFullYear()); setMonth(current.getMonth()+1);
-    setGroupes([]); setGi(0); setConges({}); setAutoMode(true);
-    setOrdre(DEFAULT_ROTATION_ORDER); setDragEq(null); setSaveMsg("");
-    setPlanStatus("loading"); setComputedEqDebut(null);
-    setServiceConfigMsg(""); setHisto([]);
-    setChatIn(""); setChatBusy(false);
-    setChatApiKey(""); setChatApiKeyInput(""); setChatApiKeyBusy(false);
-    setChatApiKeyMsg(""); setChatApiKeySource(DEFAULT_CHAT_API_KEY.trim() ? "env" : "none");
-    setShowChatApiKey(false);
-    setMsgs([{r:"a",t:"Bonjour ! 🏥 Connectez-vous pour commencer."}]);
-    setServiceHolidays([]);
-    setLeaveModal(null);
-  }
-
-  async function applyAndSaveLeave() {
-    if (!leaveModal) return;
-    const { gid, mi } = leaveModal;
-    const nc = { ...conges };
-    for (let d = Math.min(lmStart, lmEnd); d <= Math.max(lmStart, lmEnd); d++) {
-      nc[ck(gid, mi, d)] = lmType;
-    }
-    setConges(nc);
-    setLeaveModal(null);
-    setSaveMsg("⏳ Saisie rapide : sauvegarde en cours…");
-    try {
-      await save(nc, true);
-      setSaveMsg("✅ Saisie rapide enregistrée.");
-    } catch (e) {
-      setSaveMsg(`❌ Erreur saisie rapide : ${e.message}`);
-    }
-  }
-
-  const loadHolidays = useCallback(async (serviceId) => {
+  const loadLeaveTypes = useCallback(async (serviceId) => {
     if (!serviceId) return;
+    setLtBusy(true);
     try {
       const db = getSupabaseClient();
-      const { data, error } = await db.from("service_holidays").select("*").eq("service_id", serviceId).order("mois").order("jour");
+      const { data, error } = await db.from("service_leave_types")
+        .select("*").eq("service_id", serviceId).order("sort_order");
       if (error) throw error;
-      setServiceHolidays(data || []);
-    } catch (e) { console.error("Erreur fériés:", e); }
+      if (data && data.length > 0) {
+        setLeaveTypes(data);
+      } else {
+        // Seed and reload if empty
+        await db.rpc("seed_service_leave_types", { target_service_id: serviceId });
+        const { data: seeded } = await db.from("service_leave_types")
+          .select("*").eq("service_id", serviceId).order("sort_order");
+        setLeaveTypes(seeded || []);
+      }
+    } catch (e) { console.error("Erreur types congés:", e); }
+    finally { setLtBusy(false); }
   }, []);
 
+  async function addLeaveType() {
+    if (!ltForm.code.trim() || !ltForm.label.trim() || ltBusy) return;
+    setLtBusy(true);
+    try {
+      const db = getSupabaseClient();
+      const { data, error } = await db.from("service_leave_types").insert({
+        service_id: service.id,
+        code: ltForm.code.trim().toUpperCase(),
+        label: ltForm.label.trim(),
+        color: ltForm.color,
+        sort_order: leaveTypes.length * 10 + 10
+      }).select().single();
+      if (error) throw error;
+      setLeaveTypes(prev => [...prev, data]);
+      setLtForm({ code: "", label: "", color: "#3b82f6" });
+    } catch (e) { alert(e.message); } finally { setLtBusy(false); }
+  }
+
+  async function delLeaveType(id) {
+    if (ltBusy) return;
+    setLtBusy(true);
+    try {
+      const db = getSupabaseClient();
+      const { error } = await db.from("service_leave_types").delete().eq("id", id);
+      if (error) throw error;
+      setLeaveTypes(prev => prev.filter(t => t.id !== id));
+    } catch (e) { alert(e.message); } finally { setLtBusy(false); }
+  }
+
   useEffect(() => {
-    if (service?.id) loadHolidays(service.id);
-  }, [service?.id, loadHolidays]);
+    if (service?.id) {
+      loadHolidays(service.id);
+      loadLeaveTypes(service.id);
+    }
+  }, [service?.id, loadHolidays, loadLeaveTypes]);
 
   async function addHoliday() {
     if (!hLabel.trim() || hBusy) return;
@@ -647,10 +673,9 @@ export default function App() {
           const nc = {};
           congesRows.forEach(row => { const groupeId = planningGroupById[row.planning_id]; if (groupeId) nc[ck(groupeId, row.membre_index, row.jour)] = row.code; });
           
-          if (storedOrdre) setOrdre(storedOrdre);
-          else if (rotationRow?.ordre_equipes) setOrdre(rotationRow.ordre_equipes);
-          
-          if (rotationRow?.equipe_debut) setComputedEqDebut(rotationRow.equipe_debut);
+          const effectiveOrdre = storedOrdre || rotationRow?.ordre_equipes || ordre;
+          setOrdre(effectiveOrdre);
+          setComputedEqDebut(rotationRow?.equipe_debut || equipeDebut(year, month, effectiveOrdre));
 
           setConges(nc);
           setPlanStatus("saved");
@@ -1072,7 +1097,7 @@ FORMAT réponse informative :
   function openPdfPlanning() {
     setPdfMenu(false);
     const win = window.open("","_blank");
-    win.document.write(buildPdfPlanning(service,groupes,conges,year,month,ordre));
+    win.document.write(buildPdfPlanning(service,groupes,conges,year,month,leaveTypes));
     win.document.close(); setTimeout(()=>win.print(),700);
   }
 
@@ -1111,7 +1136,7 @@ FORMAT réponse informative :
   // ══════════════════════════════════════════════
   //  RENDER APP
   // ══════════════════════════════════════════════
-  const TABS=[{id:"planning",icon:"📋",lbl:"Planning"},{id:"gardes",icon:"🔄",lbl:"Rotation"},{id:"config",icon:"⚙️",lbl:"Personnel"},{id:"historique",icon:"🕓",lbl:"Historique"},{id:"chat",icon:"💬",lbl:"IA"}];
+  const TABS=[{id:"planning",icon:"📋",lbl:"Planning"},{id:"gardes",icon:"🔄",lbl:"Rotation"},{id:"config",icon:"⚙️",lbl:"Personnel"},{id:"types_conges",icon:"🏖️",lbl:"Congés"},{id:"historique",icon:"🕓",lbl:"Historique"},{id:"chat",icon:"💬",lbl:"IA"}];
   return (
     <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",background:"#070d1a",color:"#e2e8f0",fontFamily:"system-ui,sans-serif"}}>
 
@@ -1210,7 +1235,7 @@ FORMAT réponse informative :
                         <td style={{...PTD,padding:"2px 3px",color:"#64748b",fontSize:9}}>{m.grade}</td>
                         {g.hasEquipe&&<td style={{...PTD,textAlign:"center",color:g.color,fontWeight:700,fontSize:10}}>{m.equipe}</td>}
                         {Array.from({length:days},(_,i)=>{
-                          const d=i+1,dw=getDow(year,month,d),we=isWE(dw),code=conges[ck(g.id,mi,d)]||"",ci=CODES.find(c=>c.code===code),isAuto=autoMode&&g.id==="paramedical"&&code==="G",ferie=isFerieAlg(month,d);
+                          const d=i+1,dw=getDow(year,month,d),we=isWE(dw),code=conges[ck(g.id,mi,d)]||"",ci=leaveTypes.find(c=>c.code===code),isAuto=autoMode&&g.id==="paramedical"&&code==="G",ferie=isFerieAlg(month,d);
                           return <td key={d} style={{...PTD,width:21,padding:0,background:ferie?"rgba(0,40,40,.5)":we?"rgba(40,12,0,.5)":isAuto?"rgba(239,68,68,.05)":"transparent"}}>
                             <input value={code} maxLength={3} onChange={e=>setCode(g.id,mi,d,e.target.value)}
                               style={{width:21,height:20,border:"none",background:"transparent",textAlign:"center",fontSize:9,fontWeight:700,outline:"none",color:ci?ci.color:ferie?"#06b6d4":we?"#2d1a0a":"#334155",fontStyle:isAuto?"italic":"normal",cursor:"text"}}/>
@@ -1222,7 +1247,7 @@ FORMAT réponse informative :
                 </table>
               </div>
               <div style={{marginTop:8,display:"flex",gap:8,flexWrap:"wrap",fontSize:9}}>
-                {CODES.map(c=><span key={c.code}><b style={{color:c.color}}>{c.code}</b><span style={{color:"#475569"}}> {c.label}</span></span>)}
+                {leaveTypes.map(c=><span key={c.id}><b style={{color:c.color}}>{c.code}</b><span style={{color:"#475569"}}> {c.label}</span></span>)}
                 <span style={{color:"#475569"}}>· <b style={{color:"#06b6d4"}}>Cyan</b> = Jour Férié · <b style={{color:"#f97316"}}>Orange</b> = Weekend (Ven/Sam)</span>
               </div>
             </div>}
@@ -1233,22 +1258,33 @@ FORMAT réponse informative :
           <div style={{flex:1,padding:20,overflowY:"auto"}}>
             <div style={{background:"rgba(239,68,68,.06)",border:"1px solid rgba(239,68,68,.2)",borderRadius:10,padding:14,marginBottom:14,fontSize:12,color:"#94a3b8",lineHeight:1.8}}>
               🔄 Ce mois de <b style={{color:"#f8fafc"}}>{mn} {year}</b>, l'équipe <b style={{color:"#ef4444",fontSize:16}}>{eqDebut}</b> commence le 1er.<br/>
-              Glissez-déposez pour modifier l'ordre de rotation.
+              Glissez-déposez pour modifier l'ordre de rotation. Cliquez sur une équipe pour la définir comme équipe de début.
             </div>
             <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:20}}>
               {ordre.map((eq,i)=>(
-                <div key={eq} draggable onDragStart={()=>setDragEq(eq)} onDragOver={e=>e.preventDefault()} onDrop={()=>dropEq(eq)}
-                  style={{display:"flex",alignItems:"center",gap:10,padding:"12px 20px",borderRadius:10,cursor:"grab",userSelect:"none",background:eq===eqDebut?"rgba(239,68,68,.18)":"rgba(255,255,255,.05)",border:`2px solid ${eq===eqDebut?"#ef4444":"rgba(255,255,255,.12)"}`,boxShadow:dragEq===eq?"0 0 0 3px #ef444444":"none"}}>
+                <div key={eq} 
+                  onClick={() => { setComputedEqDebut(eq); setSaveMsg("⚠️ Équipe de début modifiée (n'oubliez pas de sauvegarder)"); }}
+                  draggable onDragStart={()=>setDragEq(eq)} onDragOver={e=>e.preventDefault()} onDrop={()=>dropEq(eq)}
+                  style={{display:"flex",alignItems:"center",gap:10,padding:"12px 20px",borderRadius:10,cursor:"pointer",userSelect:"none",background:eq===eqDebut?"rgba(239,68,68,.18)":"rgba(255,255,255,.05)",border:`2px solid ${eq===eqDebut?"#ef4444":"rgba(255,255,255,.12)"}`,boxShadow:dragEq===eq?"0 0 0 3px #ef444444":"none"}}>
                   <span style={{fontSize:11,color:"#475569"}}>#{i+1}</span>
                   <span style={{fontSize:22,fontWeight:800,color:eq===eqDebut?"#ef4444":"#e2e8f0"}}>Équipe {eq}</span>
-                  {eq===eqDebut&&<span style={{fontSize:9,color:"#ef4444",background:"rgba(239,68,68,.15)",padding:"2px 7px",borderRadius:8}}>ce mois</span>}
+                  {eq===eqDebut&&<span style={{fontSize:9,color:"#ef4444",background:"rgba(239,68,68,.15)",padding:"2px 7px",borderRadius:8}}>début</span>}
                   <span style={{color:"#334155",fontSize:16}}>⠿</span>
                 </div>
               ))}
             </div>
-            <button onClick={()=>setOrdre(DEFAULT_ROTATION_ORDER)} style={{...BTN,background:"rgba(255,255,255,.05)",color:"#64748b",marginBottom:20}}>↺ Reset A→B→C→D</button>
+            <div style={{display:"flex",gap:10,marginBottom:20}}>
+              <button onClick={()=>setOrdre(DEFAULT_ROTATION_ORDER)} style={{...BTN,background:"rgba(255,255,255,.05)",color:"#64748b"}}>↺ Reset A→B→C→D</button>
+              <button onClick={()=>save()} disabled={saving} style={{...BTN,background:"linear-gradient(135deg,#1d4ed8,#0891b2)"}}>
+                {saving?"⏳ Sauvegarde…":"💾 Enregistrer la Rotation"}
+              </button>
+            </div>
             <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:8}}>
-              {Array.from({length:12},(_,i)=>{ const m2=(month+i-1)%12+1,y2=year+Math.floor((month+i-1)/12),eq=equipeDebut(y2,m2,ordre),cur=m2===month&&y2===year;
+              {Array.from({length:12},(_,i)=>{ 
+                const m2=(month+i-1)%12+1,y2=year+Math.floor((month+i-1)/12);
+                // On projette à partir de la sélection actuelle pour voir l'impact
+                const eq = calculateNextEquipeDebut(year, month, eqDebut, y2, m2, ordre);
+                const cur=m2===month&&y2===year;
                 return <div key={i} style={{background:cur?"rgba(239,68,68,.09)":"rgba(255,255,255,.02)",border:`1px solid ${cur?"rgba(239,68,68,.3)":"rgba(255,255,255,.06)"}`,borderRadius:8,padding:"9px 12px"}}>
                   <div style={{fontSize:11,color:cur?"#fca5a5":"#64748b",fontWeight:cur?700:400}}>{MOIS_FR[m2-1].slice(0,4)}. {y2}</div>
                   <div style={{marginTop:4,display:"flex",gap:3}}>
@@ -1293,15 +1329,47 @@ FORMAT réponse informative :
           </div>
         )}
 
-        {tab==="historique"&&(
-          <div style={{flex:1,padding:18,overflowY:"auto"}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-              <b style={{fontSize:13,color:"#93c5fd"}}>🕓 Historique</b>
-              <button onClick={loadHisto} disabled={histoBusy} style={{...BTN,fontSize:11}}>{histoBusy?"⏳":"🔄"}</button>
+        {tab==="types_conges"&&(
+          <div style={{flex:1,padding:20,overflowY:"auto"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+              <b style={{fontSize:16,color:"#93c5fd"}}>🏖️ Types de Congés & Activités</b>
+              <div style={{fontSize:11,color:"#475569"}}>Personnalisez les codes affichés dans le planning</div>
             </div>
-            {histoBusy?<div style={{color:"#475569",textAlign:"center",padding:20}}>⏳ Chargement…</div>
-            :histo.length===0?<div style={{color:"#475569",textAlign:"center",padding:32}}>Aucun planning. Sauvegardez-en un d'abord.</div>
-            :<HistoList histo={histo} onLoad={loadPlan} onDelete={delPlan} groupMetaById={groupMetaById}/>}
+
+            <div style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.08)",borderRadius:12,padding:16,marginBottom:20}}>
+              <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"flex-end"}}>
+                <div style={{flex:1,minWidth:120}}>
+                  <div style={{fontSize:11,color:"#64748b",marginBottom:5}}>Code (ex: G)</div>
+                  <input value={ltForm.code} onChange={e=>setLtForm({...ltForm,code:e.target.value.toUpperCase()})} placeholder="G" style={INP}/>
+                </div>
+                <div style={{flex:2,minWidth:180}}>
+                  <div style={{fontSize:11,color:"#64748b",marginBottom:5}}>Libellé (ex: Garde)</div>
+                  <input value={ltForm.label} onChange={e=>setLtForm({...ltForm,label:e.target.value})} placeholder="Garde de nuit" style={INP}/>
+                </div>
+                <div style={{width:80}}>
+                  <div style={{fontSize:11,color:"#64748b",marginBottom:5}}>Couleur</div>
+                  <input type="color" value={ltForm.color} onChange={e=>setLtForm({...ltForm,color:e.target.value})} style={{...INP,padding:2,height:31}}/>
+                </div>
+                <button onClick={addLeaveType} disabled={ltBusy} style={{...BTN,background:"linear-gradient(135deg,#2563eb,#0891b2)",height:31}}>+ Ajouter</button>
+              </div>
+            </div>
+
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(250px,1fr))",gap:12}}>
+              {leaveTypes.map(t=>(
+                <div key={t.id} style={{background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.07)",borderRadius:10,padding:12,display:"flex",alignItems:"center",gap:12}}>
+                  <div style={{width:40,height:40,borderRadius:8,background:`${t.color}22`,border:`2px solid ${t.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:t.color}}>
+                    {t.code}
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:13,fontWeight:700,color:"#f8fafc"}}>{t.label}</div>
+                    <div style={{fontSize:10,color:"#475569",fontFamily:"monospace"}}>{t.color}</div>
+                  </div>
+                  {!t.is_default && (
+                    <button onClick={()=>delLeaveType(t.id)} style={{background:"rgba(239,68,68,.1)",border:"none",color:"#ef4444",borderRadius:6,padding:"5px 8px",cursor:"pointer"}}>✕</button>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
