@@ -422,6 +422,10 @@ export default function App() {
   const [showChatApiKey,  setShowChatApiKey]  = useState(false);
   const [pdfMenu,  setPdfMenu]  = useState(false);
   const [computedEqDebut, setComputedEqDebut] = useState(null);
+  const [leaveModal, setLeaveModal] = useState(null); // { gid, mi, name }
+  const [lmType, setLmType] = useState("C");
+  const [lmStart, setLmStart] = useState(1);
+  const [lmEnd, setLmEnd] = useState(1);
   const chatEnd = useRef(null);
 
   const mn      = MOIS_FR[month-1];
@@ -436,6 +440,15 @@ export default function App() {
     : { bg:"rgba(239,68,68,.10)", border:"rgba(239,68,68,.28)", color:"#fca5a5" };
   const groupMetaById = Object.fromEntries(groupes.map(group => [group.id, { label: group.label, color: group.color }]));
 
+  const [serviceHolidays, setServiceHolidays] = useState([]);
+  const [hMonth, setHMonth] = useState(month);
+  const [hDay, setHDay] = useState(1);
+  const [hLabel, setHLabel] = useState("");
+  const [hBusy, setHBusy] = useState(false);
+
+  const isFerie = (m, d) => 
+    isFerieAlg(m, d) || serviceHolidays.some(h => h.mois === m && h.jour === d);
+
   function resetWorkspace(nextService = null) {
     const current = new Date();
     setService(nextService); setLoggedIn(Boolean(nextService));
@@ -449,6 +462,83 @@ export default function App() {
     setChatApiKeyMsg(""); setChatApiKeySource(DEFAULT_CHAT_API_KEY.trim() ? "env" : "none");
     setShowChatApiKey(false);
     setMsgs([{r:"a",t:"Bonjour ! 🏥 Connectez-vous pour commencer."}]);
+    setServiceHolidays([]);
+    setLeaveModal(null);
+  }
+
+  async function applyAndSaveLeave() {
+    if (!leaveModal) return;
+    const { gid, mi } = leaveModal;
+    const nc = { ...conges };
+    for (let d = Math.min(lmStart, lmEnd); d <= Math.max(lmStart, lmEnd); d++) {
+      nc[ck(gid, mi, d)] = lmType;
+    }
+    setConges(nc);
+    setLeaveModal(null);
+    setSaveMsg("⏳ Saisie rapide : sauvegarde en cours…");
+    try {
+      await save(nc, true);
+      setSaveMsg("✅ Saisie rapide enregistrée.");
+    } catch (e) {
+      setSaveMsg(`❌ Erreur saisie rapide : ${e.message}`);
+    }
+  }
+
+  const loadHolidays = useCallback(async (serviceId) => {
+    if (!serviceId) return;
+    try {
+      const db = getSupabaseClient();
+      const { data, error } = await db.from("service_holidays").select("*").eq("service_id", serviceId).order("mois").order("jour");
+      if (error) throw error;
+      setServiceHolidays(data || []);
+    } catch (e) { console.error("Erreur fériés:", e); }
+  }, []);
+
+  useEffect(() => {
+    if (service?.id) loadHolidays(service.id);
+  }, [service?.id, loadHolidays]);
+
+  async function addHoliday() {
+    if (!hLabel.trim() || hBusy) return;
+    setHBusy(true);
+    try {
+      const db = getSupabaseClient();
+      const { data, error } = await db.from("service_holidays").insert({
+        service_id: service.id, mois: hMonth, jour: hDay, label: hLabel.trim()
+      }).select().single();
+      if (error) throw error;
+      setServiceHolidays(prev => [...prev, data].sort((a,b) => a.mois - b.mois || a.jour - b.jour));
+      setHLabel("");
+    } catch (e) { alert(e.message); } finally { setHBusy(false); }
+  }
+
+  async function delHoliday(id) {
+    if (hBusy) return;
+    setHBusy(true);
+    try {
+      const db = getSupabaseClient();
+      const { error } = await db.from("service_holidays").delete().eq("id", id);
+      if (error) throw error;
+      setServiceHolidays(prev => prev.filter(h => h.id !== id));
+    } catch (e) { alert(e.message); } finally { setHBusy(false); }
+  }
+
+  function applyHolidaysToPlanning() {
+    const nc = { ...conges };
+    let count = 0;
+    groupes.forEach(gg => {
+      gg.membres.forEach((m, mi) => {
+        for (let d = 1; d <= days; d++) {
+          if (isFerie(month, d)) {
+            const k = ck(gg.id, mi, d);
+            // On ne remplace pas une garde "G"
+            if (nc[k] !== "G") { nc[k] = "F"; count++; }
+          }
+        }
+      });
+    });
+    setConges(nc);
+    setSaveMsg(`✅ ${count} jours fériés appliqués au tableau.`);
   }
 
   const loadServiceConfig = useCallback(async(serviceId, options = {})=>{
