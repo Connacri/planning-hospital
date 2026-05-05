@@ -88,8 +88,17 @@ begin
     (paramedical_id, 'MEZIANI Youcef', 'Infirmier', 'B', 1),
     (paramedical_id, 'BRAHIMI Fatima', 'Infirmière', 'C', 2),
     (paramedical_id, 'AISSAOUI Rachid', 'Infirmier', 'D', 3),
-    (hygiene_id, 'OULD ALI Nassima', 'Agent d''Hygiène', null, 0),
-    (hygiene_id, 'FERHAT Mourad', 'Agent d''Hygiène', null, 1);
+  update public.service_groups 
+  set has_equipe = true, subtitle = 'Agents d''Hygiène — Rotation 24h'
+  where code = 'hygiene' and service_id = target_service_id;
+
+  insert into public.service_members (group_id, nom, grade, equipe, sort_order)
+  values 
+    (hygiene_id, 'OULD ALI Nassima', 'Agent d''Hygiène', 'A', 0),
+    (hygiene_id, 'FERHAT Mourad', 'Agent d''Hygiène', 'B', 1),
+    (hygiene_id, 'ZIANI Amine', 'Agent d''Hygiène', 'C', 2),
+    (hygiene_id, 'BELKACEM Samia', 'Agent d''Hygiène', 'D', 3)
+  on conflict do nothing;
 end;
 $$;
 
